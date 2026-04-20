@@ -1,35 +1,16 @@
 # -*- coding: utf-8 -*-
-"""
-升級版金融資料視覺化看板 / 程式交易平台
-- 左側：參數與策略設定
-- 右側：K線、指標、回測、最佳化結果
-- 首頁直接顯示 K 線圖
-- 新增小時 K 線
-- 保留選擇區塊
-- 淡黃色背景與標題
-- 新增網格交易、自訂策略、簡易最佳化
-"""
 
-import os
-import math
+
 import json
-import random
-import datetime
-from itertools import product
-
+import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as stc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-import indicator_forKBar_short
-from order_streamlit import Record
-
-
 # =========================================================
-# 基本設定
+# Streamlit 基本設定
 # =========================================================
 st.set_page_config(
     page_title="金融看板與程式交易平台",
@@ -37,7 +18,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 淡黃色背景 / 標題
 st.markdown("""
 <style>
     .stApp {
@@ -86,19 +66,9 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-
 # =========================================================
-# 讀取資料
+# 商品資料
 # =========================================================
-@st.cache_data(ttl=3600, show_spinner="正在讀取資料...")
-def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_pickle(path)
-    df = df.copy()
-    if "time" in df.columns:
-        df["time"] = pd.to_datetime(df["time"])
-    return df
-
-
 choices = [
     '台積電 2330: 2020.01.02 至 2025.04.16',
     '大台指期貨2024.12到期: 2023.12 至 2024.4.11',
@@ -148,19 +118,19 @@ contract_multipliers = {
     choices[9]: 1000,
     choices[10]: 200,
     choices[11]: 200,
-    choices[12]: 1,
+    choices[12]: 30,
     choices[13]: 250,
     choices[14]: 1000
 }
 
-
 # =========================================================
-# 工具函數
+# 基礎函式
 # =========================================================
-def safe_last_valid_start(series: pd.Series) -> int:
-    valid_idx = series.first_valid_index()
-    return 0 if valid_idx is None else int(valid_idx)
-
+@st.cache_data(ttl=3600, show_spinner="正在讀取資料...")
+def load_data(path: str) -> pd.DataFrame:
+    df = pd.read_pickle(path).copy()
+    df["time"] = pd.to_datetime(df["time"])
+    return df
 
 def ensure_positive_int(value, default_value=1):
     try:
@@ -168,7 +138,6 @@ def ensure_positive_int(value, default_value=1):
         return max(1, value)
     except Exception:
         return default_value
-
 
 def clamp_series(series, lower=None, upper=None):
     s = series.copy()
@@ -178,83 +147,43 @@ def clamp_series(series, lower=None, upper=None):
         s = s.clip(upper=upper)
     return s
 
-
-def performance_summary(choice, order_record):
-    multiplier = contract_multipliers.get(choice, 1)
-    if "摩台期貨" in choice:
-        multiplier *= 30
-
-    total_profit = order_record.GetTotalProfit() * multiplier
-    avg_profit = order_record.GetAverageProfit() * multiplier
-    avg_profit_rate = order_record.GetAverageProfitRate()
-    avg_earn = order_record.GetAverEarn() * multiplier
-    avg_loss = order_record.GetAverLoss() * multiplier
-    win_rate = order_record.GetWinRate()
-    acc_loss = order_record.GetAccLoss() * multiplier
-    mdd = order_record.GetMDD() * multiplier
-    rr = total_profit / mdd if mdd not in [0, None] else np.nan
-
-    return pd.DataFrame({
-        "項目": [
-            "交易總盈虧", "平均每次盈虧", "平均投資報酬率", "平均獲利",
-            "平均虧損", "勝率", "最大連續虧損", "最大回落 MDD", "報酬風險比"
-        ],
-        "數值": [
-            round(total_profit, 2),
-            round(avg_profit, 2),
-            round(avg_profit_rate, 4) if pd.notna(avg_profit_rate) else np.nan,
-            round(avg_earn, 2),
-            round(avg_loss, 2),
-            round(win_rate, 4) if pd.notna(win_rate) else np.nan,
-            round(acc_loss, 2),
-            round(mdd, 2),
-            round(rr, 4) if pd.notna(rr) else np.nan
-        ]
-    })
-
-
-@st.cache_data(ttl=3600, show_spinner="正在轉換 K 棒週期...")
-def to_dictionary(df, product_name):
-    return {
-        "time": df["time"].to_numpy(),
-        "product": np.repeat(product_name, len(df)),
-        "open": df["open"].to_numpy(),
-        "high": df["high"].to_numpy(),
-        "low": df["low"].to_numpy(),
-        "close": df["close"].to_numpy(),
-        "volume": df["volume"].to_numpy(),
-        "amount": df["amount"].to_numpy() if "amount" in df.columns else np.zeros(len(df))
-    }
-
+def get_resample_rule(unit: str, value: int) -> str:
+    value = max(1, int(value))
+    if unit == "分鐘":
+        return f"{value}min"
+    elif unit == "小時":
+        return f"{value}h"
+    elif unit == "日":
+        return f"{value}D"
+    elif unit == "週":
+        return f"{value}W"
+    elif unit == "月":
+        return f"{value}ME"
+    return "1h"
 
 @st.cache_data(ttl=3600, show_spinner="正在重整 K 棒...")
-def change_cycle(date_str, cycle_duration_minutes, kbar_dic, product_name):
-    kbar = indicator_forKBar_short.KBar(date_str, cycle_duration_minutes)
+def resample_ohlcv(df: pd.DataFrame, rule: str, product_name: str) -> pd.DataFrame:
+    x = df.copy().sort_values("time")
+    x = x.set_index("time")
 
-    for i in range(len(kbar_dic["time"])):
-        kbar.AddPrice(
-            kbar_dic["time"][i],
-            kbar_dic["open"][i],
-            kbar_dic["close"][i],
-            kbar_dic["low"][i],
-            kbar_dic["high"][i],
-            kbar_dic["volume"][i]
-        )
-
-    new_dic = {
-        "time": kbar.TAKBar["time"],
-        "product": np.repeat(product_name, len(kbar.TAKBar["time"])),
-        "open": kbar.TAKBar["open"],
-        "high": kbar.TAKBar["high"],
-        "low": kbar.TAKBar["low"],
-        "close": kbar.TAKBar["close"],
-        "volume": kbar.TAKBar["volume"]
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
     }
-    return pd.DataFrame(new_dic)
+    if "amount" in x.columns:
+        agg["amount"] = "sum"
 
+    out = x.resample(rule).agg(agg).dropna(subset=["open", "high", "low", "close"]).reset_index()
+    out["product"] = product_name
+    if "amount" not in out.columns:
+        out["amount"] = 0
+    return out
 
 # =========================================================
-# 指標
+# 技術指標
 # =========================================================
 def calc_ma(df, period=10):
     period = ensure_positive_int(period, 10)
@@ -303,7 +232,6 @@ def calc_atr(df, period=14):
 
 def calc_obv(df):
     direction = np.sign(df["close"].diff()).fillna(0)
-    direction = direction.replace({-1: -1, 1: 1})
     obv = (direction * df["volume"]).fillna(0).cumsum()
     return obv
 
@@ -400,8 +328,7 @@ def calc_psar(df, af_start=0.02, af_step=0.02, af_max=0.2):
 
 def calc_vwap(df):
     price_volume = ((df["high"] + df["low"] + df["close"]) / 3) * df["volume"]
-    vwap = price_volume.cumsum() / df["volume"].replace(0, np.nan).cumsum()
-    return vwap
+    return price_volume.cumsum() / df["volume"].replace(0, np.nan).cumsum()
 
 def calc_donchian(df, period=20):
     period = ensure_positive_int(period, 20)
@@ -433,7 +360,6 @@ def calc_adx(df, period=14):
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     adx = dx.rolling(period, min_periods=period).mean()
     return clamp_series(adx, 0, 100), plus_di, minus_di
-
 
 def add_all_indicators(df, params):
     data = df.copy()
@@ -476,11 +402,276 @@ def add_all_indicators(df, params):
 
     return data
 
+# =========================================================
+# 回測引擎
+# =========================================================
+def mark_to_market_equity(equity_curve, current_equity):
+    equity_curve.append(current_equity)
+
+def calculate_performance(trades, choice):
+    if not trades:
+        return pd.DataFrame({
+            "項目": ["交易數", "總盈虧", "勝率", "平均每筆", "最大單筆虧損", "最大單筆獲利", "最大回落", "報酬風險比"],
+            "數值": [0, 0, 0, 0, 0, 0, 0, 0]
+        })
+
+    multiplier = contract_multipliers.get(choice, 1)
+    pnl_list = [t["pnl"] * multiplier for t in trades]
+    total_profit = float(np.sum(pnl_list))
+    win_rate = float(np.mean([p > 0 for p in pnl_list])) if pnl_list else 0
+    avg_profit = float(np.mean(pnl_list)) if pnl_list else 0
+    max_loss = float(np.min(pnl_list)) if pnl_list else 0
+    max_win = float(np.max(pnl_list)) if pnl_list else 0
+
+    eq = np.cumsum(pnl_list)
+    running_max = np.maximum.accumulate(eq)
+    drawdown = running_max - eq
+    mdd = float(np.max(drawdown)) if len(drawdown) > 0 else 0
+    rr = total_profit / mdd if mdd != 0 else np.nan
+
+    return pd.DataFrame({
+        "項目": ["交易數", "總盈虧", "勝率", "平均每筆", "最大單筆虧損", "最大單筆獲利", "最大回落", "報酬風險比"],
+        "數值": [
+            len(trades),
+            round(total_profit, 2),
+            round(win_rate, 4),
+            round(avg_profit, 2),
+            round(max_loss, 2),
+            round(max_win, 2),
+            round(mdd, 2),
+            round(rr, 4) if pd.notna(rr) else np.nan
+        ]
+    })
+
+def close_trade(position, exit_time, exit_price, reason):
+    pnl = 0.0
+    if position["side"] == "long":
+        pnl = (exit_price - position["entry_price"]) * position["qty"]
+    else:
+        pnl = (position["entry_price"] - exit_price) * position["qty"]
+
+    return {
+        "side": position["side"],
+        "entry_time": position["entry_time"],
+        "entry_price": position["entry_price"],
+        "exit_time": exit_time,
+        "exit_price": exit_price,
+        "qty": position["qty"],
+        "pnl": pnl,
+        "reason": reason
+    }
+
+def backtest_strategy(df, strategy_name, params):
+    data = df.copy().reset_index(drop=True)
+    trades = []
+    signals = []
+    position = None
+    stop_price = None
+
+    qty = int(params["qty"])
+    stop_loss = float(params["stop_loss"])
+
+    def buy_signal(i):
+        if strategy_name == "移動平均線策略":
+            return (
+                pd.notna(data.loc[i-1, "MA_short"]) and
+                pd.notna(data.loc[i-1, "MA_long"]) and
+                data.loc[i-1, "MA_short"] <= data.loc[i-1, "MA_long"] and
+                data.loc[i, "MA_short"] > data.loc[i, "MA_long"]
+            )
+        elif strategy_name == "RSI逆勢策略":
+            return pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] < params["oversold"]
+        elif strategy_name == "布林通道策略":
+            return pd.notna(data.loc[i, "BB_LOWER"]) and data.loc[i, "close"] < data.loc[i, "BB_LOWER"]
+        elif strategy_name == "MACD策略":
+            return (
+                pd.notna(data.loc[i-1, "MACD"]) and pd.notna(data.loc[i-1, "MACD_SIGNAL"]) and
+                data.loc[i-1, "MACD"] <= data.loc[i-1, "MACD_SIGNAL"] and
+                data.loc[i, "MACD"] > data.loc[i, "MACD_SIGNAL"]
+            )
+        elif strategy_name == "KD策略":
+            return (
+                pd.notna(data.loc[i-1, "K"]) and pd.notna(data.loc[i-1, "D"]) and
+                data.loc[i-1, "K"] <= data.loc[i-1, "D"] and
+                data.loc[i, "K"] > data.loc[i, "D"] and
+                data.loc[i, "K"] < params["oversold"]
+            )
+        elif strategy_name == "網格交易策略":
+            return False
+        elif strategy_name == "多策略組合":
+            score = 0
+            if pd.notna(data.loc[i, "MA_short"]) and pd.notna(data.loc[i, "MA_long"]) and data.loc[i, "MA_short"] > data.loc[i, "MA_long"]:
+                score += params["w_ma"]
+            if pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] < params["oversold"]:
+                score += params["w_rsi"]
+            if pd.notna(data.loc[i, "BB_LOWER"]) and data.loc[i, "close"] < data.loc[i, "BB_LOWER"]:
+                score += params["w_bb"]
+            return score >= params["buy_threshold"]
+        return False
+
+    def sell_signal(i):
+        if strategy_name == "移動平均線策略":
+            return (
+                pd.notna(data.loc[i-1, "MA_short"]) and
+                pd.notna(data.loc[i-1, "MA_long"]) and
+                data.loc[i-1, "MA_short"] >= data.loc[i-1, "MA_long"] and
+                data.loc[i, "MA_short"] < data.loc[i, "MA_long"]
+            )
+        elif strategy_name == "RSI逆勢策略":
+            return pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] > params["overbought"]
+        elif strategy_name == "布林通道策略":
+            return pd.notna(data.loc[i, "BB_UPPER"]) and data.loc[i, "close"] > data.loc[i, "BB_UPPER"]
+        elif strategy_name == "MACD策略":
+            return (
+                pd.notna(data.loc[i-1, "MACD"]) and pd.notna(data.loc[i-1, "MACD_SIGNAL"]) and
+                data.loc[i-1, "MACD"] >= data.loc[i-1, "MACD_SIGNAL"] and
+                data.loc[i, "MACD"] < data.loc[i, "MACD_SIGNAL"]
+            )
+        elif strategy_name == "KD策略":
+            return (
+                pd.notna(data.loc[i-1, "K"]) and pd.notna(data.loc[i-1, "D"]) and
+                data.loc[i-1, "K"] >= data.loc[i-1, "D"] and
+                data.loc[i, "K"] < data.loc[i, "D"] and
+                data.loc[i, "K"] > params["overbought"]
+            )
+        elif strategy_name == "網格交易策略":
+            return False
+        elif strategy_name == "多策略組合":
+            score = 0
+            if pd.notna(data.loc[i, "MA_short"]) and pd.notna(data.loc[i, "MA_long"]) and data.loc[i, "MA_short"] < data.loc[i, "MA_long"]:
+                score += params["w_ma"]
+            if pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] > params["overbought"]:
+                score += params["w_rsi"]
+            if pd.notna(data.loc[i, "BB_UPPER"]) and data.loc[i, "close"] > data.loc[i, "BB_UPPER"]:
+                score += params["w_bb"]
+            return score >= params["sell_threshold"]
+        return False
+
+    # 網格交易單獨處理
+    if strategy_name == "網格交易策略":
+        base_price = float(data.loc[0, "close"])
+        grid_pct = params["grid_pct"]
+        max_layers = params["max_layers"]
+        grid_size = base_price * grid_pct
+        buy_levels = [base_price - (i + 1) * grid_size for i in range(max_layers)]
+        sell_levels = [base_price + (i + 1) * grid_size for i in range(max_layers)]
+
+        open_positions = []
+
+        for i in range(1, len(data) - 1):
+            price = float(data.loc[i, "close"])
+            next_open = float(data.loc[i + 1, "open"])
+            next_time = data.loc[i + 1, "time"]
+
+            # 分層買入
+            for lvl_idx, lvl in enumerate(buy_levels):
+                if price <= lvl and len(open_positions) <= lvl_idx:
+                    open_positions.append({
+                        "side": "long",
+                        "entry_time": next_time,
+                        "entry_price": next_open,
+                        "qty": qty
+                    })
+                    signals.append({
+                        "time": next_time,
+                        "price": next_open,
+                        "type": "buy",
+                        "label": f"網格買 {lvl_idx+1}"
+                    })
+
+            # 分層賣出
+            while open_positions and price >= sell_levels[len(open_positions) - 1]:
+                pos = open_positions.pop()
+                trade = close_trade(pos, next_time, next_open, "grid_take_profit")
+                trades.append(trade)
+                signals.append({
+                    "time": next_time,
+                    "price": next_open,
+                    "type": "sell",
+                    "label": "網格賣"
+                })
+
+        # 最後平倉
+        if open_positions:
+            final_time = data.loc[len(data) - 1, "time"]
+            final_price = float(data.loc[len(data) - 1, "close"])
+            for pos in open_positions:
+                trades.append(close_trade(pos, final_time, final_price, "final_close"))
+                signals.append({
+                    "time": final_time,
+                    "price": final_price,
+                    "type": "sell",
+                    "label": "期末平倉"
+                })
+
+        return trades, signals
+
+    # 一般策略
+    for i in range(2, len(data) - 1):
+        next_open = float(data.loc[i + 1, "open"])
+        next_time = data.loc[i + 1, "time"]
+        current_close = float(data.loc[i, "close"])
+
+        if position is None:
+            if buy_signal(i):
+                position = {
+                    "side": "long",
+                    "entry_time": next_time,
+                    "entry_price": next_open,
+                    "qty": qty
+                }
+                stop_price = next_open - stop_loss
+                signals.append({"time": next_time, "price": next_open, "type": "buy", "label": "買進"})
+
+            elif sell_signal(i):
+                position = {
+                    "side": "short",
+                    "entry_time": next_time,
+                    "entry_price": next_open,
+                    "qty": qty
+                }
+                stop_price = next_open + stop_loss
+                signals.append({"time": next_time, "price": next_open, "type": "sell", "label": "放空"})
+
+        else:
+            if position["side"] == "long":
+                stop_price = max(stop_price, current_close - stop_loss)
+                exit_cond = sell_signal(i) or current_close < stop_price
+                if exit_cond:
+                    trade = close_trade(position, next_time, next_open, "long_exit")
+                    trades.append(trade)
+                    signals.append({"time": next_time, "price": next_open, "type": "sell", "label": "平多"})
+                    position = None
+                    stop_price = None
+
+            elif position["side"] == "short":
+                stop_price = min(stop_price, current_close + stop_loss)
+                exit_cond = buy_signal(i) or current_close > stop_price
+                if exit_cond:
+                    trade = close_trade(position, next_time, next_open, "short_exit")
+                    trades.append(trade)
+                    signals.append({"time": next_time, "price": next_open, "type": "buy", "label": "平空"})
+                    position = None
+                    stop_price = None
+
+    if position is not None:
+        final_time = data.loc[len(data) - 1, "time"]
+        final_price = float(data.loc[len(data) - 1, "close"])
+        trade = close_trade(position, final_time, final_price, "final_close")
+        trades.append(trade)
+        signals.append({
+            "time": final_time,
+            "price": final_price,
+            "type": "sell" if position["side"] == "long" else "buy",
+            "label": "期末平倉"
+        })
+
+    return trades, signals
 
 # =========================================================
-# 圖表
+# 圖表函式
 # =========================================================
-def create_main_candlestick_chart(df, overlays):
+def create_main_chart(df, overlays, signals=None):
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
@@ -501,7 +692,11 @@ def create_main_candlestick_chart(df, overlays):
     )
 
     fig.add_trace(
-        go.Bar(x=df["time"], y=df["volume"], name="成交量"),
+        go.Bar(
+            x=df["time"],
+            y=df["volume"],
+            name="成交量"
+        ),
         row=2, col=1
     )
 
@@ -523,12 +718,43 @@ def create_main_candlestick_chart(df, overlays):
 
     if overlays.get("psar"):
         fig.add_trace(go.Scatter(
-            x=df["time"], y=df["PSAR"], mode="markers", name="PSAR", marker=dict(size=5)
+            x=df["time"],
+            y=df["PSAR"],
+            mode="markers",
+            name="PSAR",
+            marker=dict(size=5)
         ), row=1, col=1)
 
     if overlays.get("donchian"):
         fig.add_trace(go.Scatter(x=df["time"], y=df["DON_UPPER"], mode="lines", name="Donchian上"), row=1, col=1)
         fig.add_trace(go.Scatter(x=df["time"], y=df["DON_LOWER"], mode="lines", name="Donchian下"), row=1, col=1)
+
+    # 買賣點
+    if signals:
+        buy_signals = [s for s in signals if s["type"] == "buy"]
+        sell_signals = [s for s in signals if s["type"] == "sell"]
+
+        if buy_signals:
+            fig.add_trace(go.Scatter(
+                x=[s["time"] for s in buy_signals],
+                y=[s["price"] for s in buy_signals],
+                mode="markers+text",
+                name="買點",
+                text=[s["label"] for s in buy_signals],
+                textposition="top center",
+                marker=dict(symbol="triangle-up", size=12, color="green")
+            ), row=1, col=1)
+
+        if sell_signals:
+            fig.add_trace(go.Scatter(
+                x=[s["time"] for s in sell_signals],
+                y=[s["price"] for s in sell_signals],
+                mode="markers+text",
+                name="賣點",
+                text=[s["label"] for s in sell_signals],
+                textposition="bottom center",
+                marker=dict(symbol="triangle-down", size=12, color="red")
+            ), row=1, col=1)
 
     fig.update_layout(
         height=760,
@@ -538,7 +764,6 @@ def create_main_candlestick_chart(df, overlays):
         margin=dict(l=20, r=20, t=30, b=20)
     )
     return fig
-
 
 def create_indicator_chart(df, indicator_name):
     fig = go.Figure()
@@ -611,356 +836,32 @@ def create_indicator_chart(df, indicator_name):
     )
     return fig
 
+def create_equity_curve(trades, choice):
+    multiplier = contract_multipliers.get(choice, 1)
+    if not trades:
+        return go.Figure()
 
-# =========================================================
-# 策略回測
-# =========================================================
-def get_record(choice):
-    is_future = ("期貨" in choice) or ("指數期" in choice)
-    if is_future:
-        return Record(spread=3.628e-4, tax=0.00002, commission=0.0002, isFuture=True)
-    return Record(spread=3.628e-4, tax=0.003, commission=0.001425, isFuture=False)
+    pnl = [t["pnl"] * multiplier for t in trades]
+    eq = np.cumsum(pnl)
+    x = [t["exit_time"] for t in trades]
 
-
-def backtest_ma_strategy(record_obj, df, short_period, long_period, stop_loss, qty):
-    data = df.copy()
-    data["MA_S"] = calc_ma(data, short_period)
-    data["MA_L"] = calc_ma(data, long_period)
-
-    start_idx = max(safe_last_valid_start(data["MA_S"]), safe_last_valid_start(data["MA_L"]))
-    stop_price = None
-
-    for i in range(start_idx + 1, len(data) - 1):
-        if record_obj.GetOpenInterest() == 0:
-            if data["MA_S"].iloc[i - 1] <= data["MA_L"].iloc[i - 1] and data["MA_S"].iloc[i] > data["MA_L"].iloc[i]:
-                record_obj.Order("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] - stop_loss
-            elif data["MA_S"].iloc[i - 1] >= data["MA_L"].iloc[i - 1] and data["MA_S"].iloc[i] < data["MA_L"].iloc[i]:
-                record_obj.Order("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] + stop_loss
-
-        elif record_obj.GetOpenInterest() > 0:
-            stop_price = max(stop_price, data["close"].iloc[i] - stop_loss)
-            exit_cross = data["MA_S"].iloc[i] < data["MA_L"].iloc[i]
-            exit_stop = data["close"].iloc[i] < stop_price
-            if exit_cross or exit_stop:
-                record_obj.Cover("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], record_obj.GetOpenInterest())
-
-        elif record_obj.GetOpenInterest() < 0:
-            stop_price = min(stop_price, data["close"].iloc[i] + stop_loss)
-            exit_cross = data["MA_S"].iloc[i] > data["MA_L"].iloc[i]
-            exit_stop = data["close"].iloc[i] > stop_price
-            if exit_cross or exit_stop:
-                record_obj.Cover("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], -record_obj.GetOpenInterest())
-
-    return record_obj
-
-
-def backtest_rsi_strategy(record_obj, df, rsi_period, oversold, overbought, stop_loss, qty):
-    data = df.copy()
-    data["RSI"] = calc_rsi(data, rsi_period)
-    start_idx = safe_last_valid_start(data["RSI"])
-    stop_price = None
-
-    for i in range(start_idx + 1, len(data) - 1):
-        rsi = data["RSI"].iloc[i]
-
-        if record_obj.GetOpenInterest() == 0:
-            if rsi < oversold:
-                record_obj.Order("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] - stop_loss
-            elif rsi > overbought:
-                record_obj.Order("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] + stop_loss
-
-        elif record_obj.GetOpenInterest() > 0:
-            stop_price = max(stop_price, data["close"].iloc[i] - stop_loss)
-            if data["close"].iloc[i] < stop_price or rsi > overbought:
-                record_obj.Cover("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], record_obj.GetOpenInterest())
-
-        elif record_obj.GetOpenInterest() < 0:
-            stop_price = min(stop_price, data["close"].iloc[i] + stop_loss)
-            if data["close"].iloc[i] > stop_price or rsi < oversold:
-                record_obj.Cover("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], -record_obj.GetOpenInterest())
-
-    return record_obj
-
-
-def backtest_bb_strategy(record_obj, df, bb_period, bb_std, stop_loss, qty):
-    data = df.copy()
-    data["MID"], data["UP"], data["LOW"], _ = calc_bb(data, bb_period, bb_std)
-    start_idx = max(safe_last_valid_start(data["MID"]), safe_last_valid_start(data["UP"]), safe_last_valid_start(data["LOW"]))
-    stop_price = None
-
-    for i in range(start_idx + 1, len(data) - 1):
-        if record_obj.GetOpenInterest() == 0:
-            if data["close"].iloc[i] < data["LOW"].iloc[i]:
-                record_obj.Order("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] - stop_loss
-            elif data["close"].iloc[i] > data["UP"].iloc[i]:
-                record_obj.Order("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] + stop_loss
-
-        elif record_obj.GetOpenInterest() > 0:
-            stop_price = max(stop_price, data["close"].iloc[i] - stop_loss)
-            if data["close"].iloc[i] > data["MID"].iloc[i] or data["close"].iloc[i] < stop_price:
-                record_obj.Cover("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], record_obj.GetOpenInterest())
-
-        elif record_obj.GetOpenInterest() < 0:
-            stop_price = min(stop_price, data["close"].iloc[i] + stop_loss)
-            if data["close"].iloc[i] < data["MID"].iloc[i] or data["close"].iloc[i] > stop_price:
-                record_obj.Cover("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], -record_obj.GetOpenInterest())
-
-    return record_obj
-
-
-def backtest_macd_strategy(record_obj, df, fast_period, slow_period, signal_period, stop_loss, qty):
-    data = df.copy()
-    _, _, data["MACD"], data["SIGNAL"], _ = calc_macd(data, fast_period, slow_period, signal_period)
-    start_idx = max(safe_last_valid_start(data["MACD"]), safe_last_valid_start(data["SIGNAL"]))
-    stop_price = None
-
-    for i in range(start_idx + 1, len(data) - 1):
-        bull = data["MACD"].iloc[i - 1] <= data["SIGNAL"].iloc[i - 1] and data["MACD"].iloc[i] > data["SIGNAL"].iloc[i]
-        bear = data["MACD"].iloc[i - 1] >= data["SIGNAL"].iloc[i - 1] and data["MACD"].iloc[i] < data["SIGNAL"].iloc[i]
-
-        if record_obj.GetOpenInterest() == 0:
-            if bull:
-                record_obj.Order("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] - stop_loss
-            elif bear:
-                record_obj.Order("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] + stop_loss
-
-        elif record_obj.GetOpenInterest() > 0:
-            stop_price = max(stop_price, data["close"].iloc[i] - stop_loss)
-            if bear or data["close"].iloc[i] < stop_price:
-                record_obj.Cover("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], record_obj.GetOpenInterest())
-
-        elif record_obj.GetOpenInterest() < 0:
-            stop_price = min(stop_price, data["close"].iloc[i] + stop_loss)
-            if bull or data["close"].iloc[i] > stop_price:
-                record_obj.Cover("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], -record_obj.GetOpenInterest())
-
-    return record_obj
-
-
-def backtest_kd_strategy(record_obj, df, k_period, d_period, oversold, overbought, stop_loss, qty):
-    data = df.copy()
-    data["K"], data["D"] = calc_kd(data, k_period, d_period)
-    start_idx = max(safe_last_valid_start(data["K"]), safe_last_valid_start(data["D"]))
-    stop_price = None
-
-    for i in range(start_idx + 1, len(data) - 1):
-        bull = data["K"].iloc[i - 1] <= data["D"].iloc[i - 1] and data["K"].iloc[i] > data["D"].iloc[i]
-        bear = data["K"].iloc[i - 1] >= data["D"].iloc[i - 1] and data["K"].iloc[i] < data["D"].iloc[i]
-
-        if record_obj.GetOpenInterest() == 0:
-            if bull and data["K"].iloc[i] < oversold:
-                record_obj.Order("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] - stop_loss
-            elif bear and data["K"].iloc[i] > overbought:
-                record_obj.Order("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] + stop_loss
-
-        elif record_obj.GetOpenInterest() > 0:
-            stop_price = max(stop_price, data["close"].iloc[i] - stop_loss)
-            if bear or data["close"].iloc[i] < stop_price:
-                record_obj.Cover("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], record_obj.GetOpenInterest())
-
-        elif record_obj.GetOpenInterest() < 0:
-            stop_price = min(stop_price, data["close"].iloc[i] + stop_loss)
-            if bull or data["close"].iloc[i] > stop_price:
-                record_obj.Cover("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], -record_obj.GetOpenInterest())
-
-    return record_obj
-
-
-def backtest_grid_strategy(record_obj, df, grid_pct=0.02, max_layers=5, qty=1):
-    """
-    簡化版網格交易：
-    - 以第一根 close 為基準
-    - 每跌一格加碼買，回到上一格以上出場
-    - 只示範多單網格
-    """
-    data = df.copy()
-    if len(data) < 3:
-        return record_obj
-
-    base_price = data["close"].iloc[0]
-    grid_size = base_price * grid_pct
-    buy_levels = [base_price - i * grid_size for i in range(1, max_layers + 1)]
-    sell_levels = [base_price + i * grid_size for i in range(1, max_layers + 1)]
-
-    current_layer = 0
-    for i in range(1, len(data) - 1):
-        price = data["close"].iloc[i]
-
-        if current_layer < max_layers and price <= buy_levels[current_layer]:
-            record_obj.Order("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-            current_layer += 1
-
-        elif current_layer > 0:
-            target_sell_idx = max(current_layer - 1, 0)
-            if price >= sell_levels[target_sell_idx]:
-                record_obj.Cover("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], min(qty, record_obj.GetOpenInterest()))
-                current_layer -= 1
-
-    return record_obj
-
-
-def backtest_multi_strategy(record_obj, df, params, stop_loss, qty):
-    data = df.copy()
-    data["MA_S"] = calc_ma(data, params["ma_short"])
-    data["MA_L"] = calc_ma(data, params["ma_long"])
-    data["RSI"] = calc_rsi(data, params["rsi_period"])
-    data["BB_MID"], data["BB_UP"], data["BB_LOW"], _ = calc_bb(data, params["bb_period"], params["bb_std"])
-
-    start_idx = max(
-        safe_last_valid_start(data["MA_S"]),
-        safe_last_valid_start(data["MA_L"]),
-        safe_last_valid_start(data["RSI"]),
-        safe_last_valid_start(data["BB_MID"]),
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=eq, mode="lines+markers", name="累積損益"))
+    fig.update_layout(
+        height=350,
+        template="plotly_white",
+        margin=dict(l=20, r=20, t=30, b=20)
     )
-    stop_price = None
-    signal_rows = []
-
-    for i in range(start_idx + 1, len(data) - 1):
-        buy_score = 0.0
-        sell_score = 0.0
-
-        ma_signal = 0.0
-        rsi_signal = 0.0
-        bb_signal = 0.0
-
-        if data["MA_S"].iloc[i] > data["MA_L"].iloc[i]:
-            buy_score += params["w_ma"]
-            ma_signal = params["w_ma"]
-        elif data["MA_S"].iloc[i] < data["MA_L"].iloc[i]:
-            sell_score += params["w_ma"]
-            ma_signal = -params["w_ma"]
-
-        if data["RSI"].iloc[i] < params["oversold"]:
-            buy_score += params["w_rsi"]
-            rsi_signal = params["w_rsi"]
-        elif data["RSI"].iloc[i] > params["overbought"]:
-            sell_score += params["w_rsi"]
-            rsi_signal = -params["w_rsi"]
-
-        if data["close"].iloc[i] < data["BB_LOW"].iloc[i]:
-            buy_score += params["w_bb"]
-            bb_signal = params["w_bb"]
-        elif data["close"].iloc[i] > data["BB_UP"].iloc[i]:
-            sell_score += params["w_bb"]
-            bb_signal = -params["w_bb"]
-
-        signal_rows.append({
-            "time": data["time"].iloc[i],
-            "buy_score": buy_score,
-            "sell_score": sell_score,
-            "MA_signal": ma_signal,
-            "RSI_signal": rsi_signal,
-            "BB_signal": bb_signal
-        })
-
-        if record_obj.GetOpenInterest() == 0:
-            if buy_score >= params["buy_threshold"]:
-                record_obj.Order("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] - stop_loss
-            elif sell_score >= params["sell_threshold"]:
-                record_obj.Order("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] + stop_loss
-
-        elif record_obj.GetOpenInterest() > 0:
-            stop_price = max(stop_price, data["close"].iloc[i] - stop_loss)
-            if sell_score >= params["sell_threshold"] or data["close"].iloc[i] < stop_price:
-                record_obj.Cover("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], record_obj.GetOpenInterest())
-
-        elif record_obj.GetOpenInterest() < 0:
-            stop_price = min(stop_price, data["close"].iloc[i] + stop_loss)
-            if buy_score >= params["buy_threshold"] or data["close"].iloc[i] > stop_price:
-                record_obj.Cover("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], -record_obj.GetOpenInterest())
-
-    signals_df = pd.DataFrame(signal_rows)
-    return record_obj, signals_df
-
-
-def backtest_custom_strategy(record_obj, df, custom_rules, stop_loss, qty):
-    """
-    自訂策略規則：
-    custom_rules = [
-      {"left":"RSI", "op":"<", "right":30, "side":"buy"},
-      {"left":"MACD", "op":">", "right":"MACD_SIGNAL", "side":"buy"},
-      {"left":"RSI", "op":">", "right":70, "side":"sell"}
-    ]
-    """
-    data = df.copy()
-    stop_price = None
-
-    def get_value(row, value):
-        if isinstance(value, str) and value in row.index:
-            return row[value]
-        return value
-
-    def eval_rule(row, rule):
-        left = get_value(row, rule["left"])
-        right = get_value(row, rule["right"])
-        op = rule["op"]
-
-        if pd.isna(left) or pd.isna(right):
-            return False
-
-        if op == ">":
-            return left > right
-        if op == "<":
-            return left < right
-        if op == ">=":
-            return left >= right
-        if op == "<=":
-            return left <= right
-        if op == "==":
-            return left == right
-        return False
-
-    for i in range(1, len(data) - 1):
-        row = data.iloc[i]
-
-        buy_rules = [r for r in custom_rules if r["side"] == "buy"]
-        sell_rules = [r for r in custom_rules if r["side"] == "sell"]
-
-        buy_signal = all(eval_rule(row, r) for r in buy_rules) if buy_rules else False
-        sell_signal = all(eval_rule(row, r) for r in sell_rules) if sell_rules else False
-
-        if record_obj.GetOpenInterest() == 0:
-            if buy_signal:
-                record_obj.Order("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] - stop_loss
-            elif sell_signal:
-                record_obj.Order("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], qty)
-                stop_price = data["open"].iloc[i + 1] + stop_loss
-
-        elif record_obj.GetOpenInterest() > 0:
-            stop_price = max(stop_price, data["close"].iloc[i] - stop_loss)
-            if sell_signal or data["close"].iloc[i] < stop_price:
-                record_obj.Cover("Sell", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], record_obj.GetOpenInterest())
-
-        elif record_obj.GetOpenInterest() < 0:
-            stop_price = min(stop_price, data["close"].iloc[i] + stop_loss)
-            if buy_signal or data["close"].iloc[i] > stop_price:
-                record_obj.Cover("Buy", data["product"].iloc[i + 1], data["time"].iloc[i + 1], data["open"].iloc[i + 1], -record_obj.GetOpenInterest())
-
-    return record_obj
-
+    return fig
 
 # =========================================================
-# 側邊欄：參數區
+# 左側控制區
 # =========================================================
 with st.sidebar:
     st.header("資料與參數設定")
 
     choice = st.selectbox("選擇金融商品", choices, index=0)
     pkl_path, product_name, default_start, default_end = product_info[choice]
-
     df_original = load_data(pkl_path)
 
     start_date = st.date_input("開始日期", pd.to_datetime(default_start).date())
@@ -968,28 +869,18 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("K 棒週期")
-
-    timeframe_mode = st.selectbox(
-        "時間單位",
-        ["分鐘", "小時", "日", "週", "月"],
-        index=1
-    )
+    timeframe_mode = st.selectbox("時間單位", ["分鐘", "小時", "日", "週", "月"], index=1)
 
     if timeframe_mode == "分鐘":
         tf_value = st.number_input("每根 K 棒分鐘數", min_value=1, max_value=1440, value=60, step=1)
-        cycle_duration = tf_value
     elif timeframe_mode == "小時":
         tf_value = st.number_input("每根 K 棒小時數", min_value=1, max_value=24, value=1, step=1)
-        cycle_duration = tf_value * 60
     elif timeframe_mode == "日":
         tf_value = st.number_input("每根 K 棒天數", min_value=1, max_value=365, value=1, step=1)
-        cycle_duration = tf_value * 1440
     elif timeframe_mode == "週":
         tf_value = st.number_input("每根 K 棒週數", min_value=1, max_value=52, value=1, step=1)
-        cycle_duration = tf_value * 7 * 1440
     else:
         tf_value = st.number_input("每根 K 棒月數", min_value=1, max_value=24, value=1, step=1)
-        cycle_duration = tf_value * 30 * 1440
 
     st.markdown("---")
     st.subheader("技術指標參數")
@@ -1019,7 +910,7 @@ with st.sidebar:
     }
 
     st.markdown("---")
-    st.subheader("主圖疊加顯示")
+    st.subheader("主圖疊加")
     overlay_ma = st.checkbox("MA", value=True)
     overlay_ema = st.checkbox("EMA", value=False)
     overlay_bb = st.checkbox("布林通道", value=True)
@@ -1028,9 +919,9 @@ with st.sidebar:
     overlay_donchian = st.checkbox("Donchian", value=False)
 
     st.markdown("---")
-    st.subheader("回測設定")
+    st.subheader("回測策略")
     strategy_choice = st.selectbox(
-        "選擇交易策略",
+        "策略選擇",
         [
             "移動平均線策略",
             "RSI逆勢策略",
@@ -1038,49 +929,26 @@ with st.sidebar:
             "MACD策略",
             "KD策略",
             "網格交易策略",
-            "多策略組合",
-            "自訂策略"
+            "多策略組合"
         ],
         index=0
     )
 
-    order_qty = st.number_input("下單口數 / 張數", min_value=1, max_value=1000, value=1)
-    move_stop_loss = st.number_input("移動停損點數", min_value=0.0, value=30.0, step=1.0)
-
-    # 策略參數
-    oversold = st.slider("超賣值", 1, 50, 30)
-    overbought = st.slider("超買值", 50, 99, 70)
-
-    grid_pct = st.slider("網格間距 (%)", 0.1, 10.0, 2.0, 0.1) / 100.0
-    max_layers = st.slider("網格最大層數", 1, 20, 5)
-
-    st.markdown("---")
-    st.subheader("多策略組合參數")
-    buy_threshold = st.slider("買入分數門檻", 0.0, 2.0, 0.8, 0.05)
-    sell_threshold = st.slider("賣出分數門檻", 0.0, 2.0, 0.8, 0.05)
-    w_ma = st.slider("MA 權重", 0.0, 1.0, 0.4, 0.05)
-    w_rsi = st.slider("RSI 權重", 0.0, 1.0, 0.3, 0.05)
-    w_bb = st.slider("BB 權重", 0.0, 1.0, 0.3, 0.05)
-
-    st.markdown("---")
-    st.subheader("自訂策略")
-    st.caption("欄位名稱可用：RSI, MACD, MACD_SIGNAL, close, MA_short, MA_long, K, D, MFI, ADX, VWAP")
-    custom_rules_text = st.text_area(
-        "輸入 JSON 規則",
-        value=json.dumps([
-            {"left": "RSI", "op": "<", "right": 30, "side": "buy"},
-            {"left": "MACD", "op": ">", "right": "MACD_SIGNAL", "side": "buy"},
-            {"left": "RSI", "op": ">", "right": 70, "side": "sell"}
-        ], ensure_ascii=False, indent=2),
-        height=220
-    )
-
-    st.markdown("---")
-    optimize_switch = st.checkbox("啟用簡易最佳化", value=False)
-    optimize_target = st.selectbox("最佳化目標", ["交易總盈虧", "報酬風險比"], index=0)
+    backtest_params = {
+        "qty": st.number_input("下單口數 / 張數", min_value=1, max_value=1000, value=1),
+        "stop_loss": st.number_input("移動停損點數", min_value=0.0, value=30.0, step=1.0),
+        "oversold": st.slider("超賣", 1, 50, 30),
+        "overbought": st.slider("超買", 50, 99, 70),
+        "grid_pct": st.slider("網格間距 (%)", 0.1, 10.0, 2.0, 0.1) / 100.0,
+        "max_layers": st.slider("網格最大層數", 1, 20, 5),
+        "buy_threshold": st.slider("買入分數門檻", 0.0, 2.0, 0.8, 0.05),
+        "sell_threshold": st.slider("賣出分數門檻", 0.0, 2.0, 0.8, 0.05),
+        "w_ma": st.slider("MA 權重", 0.0, 1.0, 0.4, 0.05),
+        "w_rsi": st.slider("RSI 權重", 0.0, 1.0, 0.3, 0.05),
+        "w_bb": st.slider("BB 權重", 0.0, 1.0, 0.3, 0.05),
+    }
 
     run_backtest = st.button("開始回測", use_container_width=True)
-
 
 # =========================================================
 # 資料處理
@@ -1091,285 +959,111 @@ end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=
 df_filtered = df_original[(df_original["time"] >= start_ts) & (df_original["time"] <= end_ts)].copy()
 
 if df_filtered.empty:
-    st.error("目前選擇的日期區間沒有資料。")
+    st.error("目前選擇區間沒有資料。")
     st.stop()
 
-kbar_dic = to_dictionary(df_filtered, product_name)
-date_str = pd.to_datetime(start_ts).strftime("%Y-%m-%d")
-kbar_df = change_cycle(date_str, float(cycle_duration), kbar_dic, product_name)
-kbar_df["time"] = pd.to_datetime(kbar_df["time"])
+rule = get_resample_rule(timeframe_mode, tf_value)
+kbar_df = resample_ohlcv(df_filtered, rule, product_name)
 
-if len(kbar_df) < 30:
-    st.warning("重整後的 K 棒數量太少，請放大日期區間或改小 K 棒週期。")
+if len(kbar_df) < 10:
+    st.warning("重整後 K 棒太少，請縮短週期或增加日期範圍。")
 
 indicator_df = add_all_indicators(kbar_df, params)
 
-# 額外給自訂策略欄位名稱相容
-indicator_df["MA_short"] = indicator_df["MA_short"]
-indicator_df["MA_long"] = indicator_df["MA_long"]
-
-
 # =========================================================
-# 主畫面
+# 右邊兩頁版面
 # =========================================================
-left_info, right_chart = st.columns([1, 2.4], gap="large")
+left_col, right_col = st.columns([1, 2.5], gap="large")
 
-with left_info:
+with left_col:
     st.markdown('<div class="summary-card">', unsafe_allow_html=True)
-    st.subheader("目前資料摘要")
+    st.subheader("資料摘要")
     st.write(f"商品：**{product_name}**")
-    st.write(f"時間範圍：**{start_ts.date()} ~ {end_ts.date()}**")
-    st.write(f"K 棒單位：**{timeframe_mode} / {tf_value}**")
+    st.write(f"區間：**{start_ts.date()} ~ {end_ts.date()}**")
+    st.write(f"K棒：**{timeframe_mode} / {tf_value}**")
     st.write(f"筆數：**{len(indicator_df):,}**")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="summary-card">', unsafe_allow_html=True)
-    st.subheader("指標合理性檢查")
-    check_msgs = []
-
-    if indicator_df["RSI"].dropna().between(0, 100).all():
-        check_msgs.append("RSI 範圍正常（0~100）")
-    else:
-        check_msgs.append("RSI 有超出 0~100，已建議檢查資料")
-
-    if indicator_df["K"].dropna().between(0, 100).all() and indicator_df["D"].dropna().between(0, 100).all():
-        check_msgs.append("KD 範圍正常（0~100）")
-    else:
-        check_msgs.append("KD 有超出 0~100")
-
-    if indicator_df["MFI"].dropna().between(0, 100).all():
-        check_msgs.append("MFI 範圍正常（0~100）")
-    else:
-        check_msgs.append("MFI 有超出 0~100")
-
-    if indicator_df["WILLR"].dropna().between(-100, 0).all():
-        check_msgs.append("WILLR 範圍正常（-100~0）")
-    else:
-        check_msgs.append("WILLR 有超出 -100~0")
-
-    if indicator_df["ADX"].dropna().between(0, 100).all():
-        check_msgs.append("ADX 範圍正常（0~100）")
-    else:
-        check_msgs.append("ADX 有超出 0~100")
-
-    for msg in check_msgs:
-        st.write(f"- {msg}")
-
-    st.markdown('<div class="small-note">新增指標：VWAP、Donchian、ADX，可更方便做趨勢/突破/均值回歸判斷。</div>', unsafe_allow_html=True)
+    st.subheader("指標檢查")
+    checks = []
+    checks.append("RSI 正常" if indicator_df["RSI"].dropna().between(0, 100).all() else "RSI 超出範圍")
+    checks.append("KD 正常" if indicator_df["K"].dropna().between(0, 100).all() and indicator_df["D"].dropna().between(0, 100).all() else "KD 超出範圍")
+    checks.append("MFI 正常" if indicator_df["MFI"].dropna().between(0, 100).all() else "MFI 超出範圍")
+    checks.append("WILLR 正常" if indicator_df["WILLR"].dropna().between(-100, 0).all() else "WILLR 超出範圍")
+    checks.append("ADX 正常" if indicator_df["ADX"].dropna().between(0, 100).all() else "ADX 超出範圍")
+    for c in checks:
+        st.write(f"- {c}")
+    st.markdown('<div class="small-note">新增：VWAP、Donchian、ADX；主頁直接 K 線；可畫買賣點。</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-with right_chart:
-    st.subheader("主頁 K 線圖")
-    main_fig = create_main_candlestick_chart(
-        indicator_df,
-        overlays={
-            "ma": overlay_ma,
-            "ema": overlay_ema,
-            "bb": overlay_bb,
-            "vwap": overlay_vwap,
-            "psar": overlay_psar,
-            "donchian": overlay_donchian
-        }
-    )
-    st.plotly_chart(main_fig, use_container_width=True)
+with right_col:
+    tab_basic, tab_backtest = st.tabs(["基本圖表", "回測分析"])
 
-tab1, tab2, tab3, tab4 = st.tabs(["技術指標", "策略回測", "最佳化", "資料表"])
+    with tab_basic:
+        st.subheader("主頁 K 線圖")
+        main_fig = create_main_chart(
+            indicator_df,
+            overlays={
+                "ma": overlay_ma,
+                "ema": overlay_ema,
+                "bb": overlay_bb,
+                "vwap": overlay_vwap,
+                "psar": overlay_psar,
+                "donchian": overlay_donchian
+            },
+            signals=None
+        )
+        st.plotly_chart(main_fig, use_container_width=True)
 
-with tab1:
-    indicators_to_show = st.multiselect(
-        "選擇要顯示的指標",
-        ["RSI", "MACD", "ATR", "OBV", "CCI", "KD", "WILLR", "MFI", "ROC", "MOM", "TRIX", "ADX", "BB_WIDTH"],
-        default=["RSI", "MACD", "ATR"]
-    )
-    for indicator_name in indicators_to_show:
-        st.plotly_chart(create_indicator_chart(indicator_df, indicator_name), use_container_width=True)
+        selected_indicators = st.multiselect(
+            "選擇要顯示的附加指標",
+            ["RSI", "MACD", "ATR", "OBV", "CCI", "KD", "WILLR", "MFI", "ROC", "MOM", "TRIX", "ADX", "BB_WIDTH"],
+            default=["RSI", "MACD", "ATR"]
+        )
 
-with tab2:
-    st.subheader("回測結果")
+        for name in selected_indicators:
+            st.plotly_chart(create_indicator_chart(indicator_df, name), use_container_width=True)
 
-    order_record = None
-    signals_df = pd.DataFrame()
+    with tab_backtest:
+        st.subheader("回測結果與買賣點")
 
-    if run_backtest:
-        try:
-            order_record = get_record(choice)
+        if run_backtest:
+            trades, signals = backtest_strategy(indicator_df, strategy_choice, backtest_params)
 
-            if strategy_choice == "移動平均線策略":
-                order_record = backtest_ma_strategy(
-                    order_record, indicator_df, params["ma_short"], params["ma_long"], move_stop_loss, int(order_qty)
+            bt_fig = create_main_chart(
+                indicator_df,
+                overlays={
+                    "ma": overlay_ma,
+                    "ema": overlay_ema,
+                    "bb": overlay_bb,
+                    "vwap": overlay_vwap,
+                    "psar": overlay_psar,
+                    "donchian": overlay_donchian
+                },
+                signals=signals
+            )
+            st.plotly_chart(bt_fig, use_container_width=True)
+
+            perf_df = calculate_performance(trades, choice)
+            st.dataframe(perf_df, use_container_width=True, hide_index=True)
+
+            eq_fig = create_equity_curve(trades, choice)
+            if len(eq_fig.data) > 0:
+                st.plotly_chart(eq_fig, use_container_width=True)
+
+            if trades:
+                trades_df = pd.DataFrame(trades)
+                trades_df["entry_time"] = pd.to_datetime(trades_df["entry_time"])
+                trades_df["exit_time"] = pd.to_datetime(trades_df["exit_time"])
+                trades_df["pnl_value"] = trades_df["pnl"] * contract_multipliers.get(choice, 1)
+                st.subheader("交易紀錄")
+                st.dataframe(
+                    trades_df[["side", "entry_time", "entry_price", "exit_time", "exit_price", "qty", "pnl_value", "reason"]],
+                    use_container_width=True
                 )
-
-            elif strategy_choice == "RSI逆勢策略":
-                order_record = backtest_rsi_strategy(
-                    order_record, indicator_df, params["rsi_period"], oversold, overbought, move_stop_loss, int(order_qty)
-                )
-
-            elif strategy_choice == "布林通道策略":
-                order_record = backtest_bb_strategy(
-                    order_record, indicator_df, params["bb_period"], params["bb_std"], move_stop_loss, int(order_qty)
-                )
-
-            elif strategy_choice == "MACD策略":
-                order_record = backtest_macd_strategy(
-                    order_record, indicator_df, params["macd_fast"], params["macd_slow"], params["macd_signal"], move_stop_loss, int(order_qty)
-                )
-
-            elif strategy_choice == "KD策略":
-                order_record = backtest_kd_strategy(
-                    order_record, indicator_df, params["k_period"], params["d_period"], oversold, overbought, move_stop_loss, int(order_qty)
-                )
-
-            elif strategy_choice == "網格交易策略":
-                order_record = backtest_grid_strategy(
-                    order_record, indicator_df, grid_pct=grid_pct, max_layers=max_layers, qty=int(order_qty)
-                )
-
-            elif strategy_choice == "多策略組合":
-                order_record, signals_df = backtest_multi_strategy(
-                    order_record,
-                    indicator_df,
-                    {
-                        "ma_short": params["ma_short"],
-                        "ma_long": params["ma_long"],
-                        "rsi_period": params["rsi_period"],
-                        "bb_period": params["bb_period"],
-                        "bb_std": params["bb_std"],
-                        "oversold": oversold,
-                        "overbought": overbought,
-                        "buy_threshold": buy_threshold,
-                        "sell_threshold": sell_threshold,
-                        "w_ma": w_ma,
-                        "w_rsi": w_rsi,
-                        "w_bb": w_bb
-                    },
-                    move_stop_loss,
-                    int(order_qty)
-                )
-
-            elif strategy_choice == "自訂策略":
-                custom_rules = json.loads(custom_rules_text)
-                order_record = backtest_custom_strategy(
-                    order_record, indicator_df, custom_rules, move_stop_loss, int(order_qty)
-                )
-
-            st.success("回測完成")
-
-            if hasattr(order_record, "Profit") and len(order_record.Profit) > 0:
-                perf_df = performance_summary(choice, order_record)
-                st.dataframe(perf_df, use_container_width=True, hide_index=True)
             else:
-                st.warning("目前沒有產生交易紀錄。可以調整策略參數或放大日期區間。")
+                st.warning("沒有產生交易紀錄，請調整策略或參數。")
 
-            if not signals_df.empty:
-                st.subheader("多策略信號分析")
-                sig_fig = make_subplots(
-                    rows=2, cols=1, shared_xaxes=True,
-                    row_heights=[0.55, 0.45], vertical_spacing=0.06
-                )
-                sig_fig.add_trace(go.Scatter(x=signals_df["time"], y=signals_df["buy_score"], mode="lines", name="買入分數"), row=1, col=1)
-                sig_fig.add_trace(go.Scatter(x=signals_df["time"], y=signals_df["sell_score"], mode="lines", name="賣出分數"), row=1, col=1)
-                sig_fig.add_hline(y=buy_threshold, line_dash="dash", row=1, col=1)
-                sig_fig.add_hline(y=sell_threshold, line_dash="dash", row=1, col=1)
-
-                sig_fig.add_trace(go.Bar(x=signals_df["time"], y=signals_df["MA_signal"], name="MA貢獻"), row=2, col=1)
-                sig_fig.add_trace(go.Bar(x=signals_df["time"], y=signals_df["RSI_signal"], name="RSI貢獻"), row=2, col=1)
-                sig_fig.add_trace(go.Bar(x=signals_df["time"], y=signals_df["BB_signal"], name="BB貢獻"), row=2, col=1)
-
-                sig_fig.update_layout(height=700, template="plotly_white")
-                st.plotly_chart(sig_fig, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"回測時發生錯誤：{e}")
-
-    else:
-        st.info("左側設定好參數後，按「開始回測」。")
-
-with tab3:
-    st.subheader("簡易最佳化")
-
-    if optimize_switch:
-        try:
-            results = []
-
-            # 只做較小範圍，避免太慢
-            if strategy_choice == "移動平均線策略":
-                short_candidates = [3, 5, 8, 10]
-                long_candidates = [15, 20, 30, 50]
-
-                for sp, lp in product(short_candidates, long_candidates):
-                    if sp >= lp:
-                        continue
-                    rec = get_record(choice)
-                    rec = backtest_ma_strategy(rec, indicator_df, sp, lp, move_stop_loss, int(order_qty))
-
-                    if hasattr(rec, "Profit") and len(rec.Profit) > 0:
-                        perf_df = performance_summary(choice, rec)
-                        perf = dict(zip(perf_df["項目"], perf_df["數值"]))
-                        results.append({
-                            "ma_short": sp,
-                            "ma_long": lp,
-                            "交易總盈虧": perf["交易總盈虧"],
-                            "報酬風險比": perf["報酬風險比"]
-                        })
-
-            elif strategy_choice == "RSI逆勢策略":
-                rsi_candidates = [6, 10, 14, 21]
-                os_candidates = [20, 25, 30]
-                ob_candidates = [70, 75, 80]
-
-                for rp, osd, obd in product(rsi_candidates, os_candidates, ob_candidates):
-                    rec = get_record(choice)
-                    rec = backtest_rsi_strategy(rec, indicator_df, rp, osd, obd, move_stop_loss, int(order_qty))
-
-                    if hasattr(rec, "Profit") and len(rec.Profit) > 0:
-                        perf_df = performance_summary(choice, rec)
-                        perf = dict(zip(perf_df["項目"], perf_df["數值"]))
-                        results.append({
-                            "rsi_period": rp,
-                            "oversold": osd,
-                            "overbought": obd,
-                            "交易總盈虧": perf["交易總盈虧"],
-                            "報酬風險比": perf["報酬風險比"]
-                        })
-
-            elif strategy_choice == "網格交易策略":
-                grid_candidates = [0.01, 0.015, 0.02, 0.03]
-                layer_candidates = [3, 5, 7, 10]
-
-                for gp, ml in product(grid_candidates, layer_candidates):
-                    rec = get_record(choice)
-                    rec = backtest_grid_strategy(rec, indicator_df, gp, ml, int(order_qty))
-
-                    if hasattr(rec, "Profit") and len(rec.Profit) > 0:
-                        perf_df = performance_summary(choice, rec)
-                        perf = dict(zip(perf_df["項目"], perf_df["數值"]))
-                        results.append({
-                            "grid_pct": gp,
-                            "max_layers": ml,
-                            "交易總盈虧": perf["交易總盈虧"],
-                            "報酬風險比": perf["報酬風險比"]
-                        })
-
-            if results:
-                opt_df = pd.DataFrame(results)
-                metric = optimize_target
-                opt_df = opt_df.sort_values(metric, ascending=False, na_position="last")
-                st.dataframe(opt_df, use_container_width=True)
-
-                st.subheader("最佳前 10 組")
-                st.dataframe(opt_df.head(10), use_container_width=True)
-            else:
-                st.warning("目前這個策略類型沒有產出可用的最佳化結果。")
-        except Exception as e:
-            st.error(f"最佳化時發生錯誤：{e}")
-    else:
-        st.info("左側勾選「啟用簡易最佳化」後，這裡會顯示結果。")
-
-with tab4:
-    st.subheader("資料表")
-    show_cols = st.multiselect(
-        "選擇欄位",
-        indicator_df.columns.tolist(),
-        default=["time", "open", "high", "low", "close", "volume", "MA_short", "MA_long", "RSI", "MACD", "ATR", "VWAP"]
-    )
-    st.dataframe(indicator_df[show_cols], use_container_width=True, height=500)
+        else:
+            st.info("請先在左邊設定參數後按「開始回測」。")
