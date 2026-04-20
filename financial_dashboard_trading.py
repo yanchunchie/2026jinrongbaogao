@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-
+"""
+金融資料視覺化看板 / 程式交易平台
+Python 3.12 compatible
+"""
 
 import itertools
 import numpy as np
@@ -131,12 +134,14 @@ def load_data(path: str) -> pd.DataFrame:
     df["time"] = pd.to_datetime(df["time"])
     return df
 
+
 def ensure_positive_int(value, default_value=1):
     try:
         value = int(value)
         return max(1, value)
     except Exception:
         return default_value
+
 
 def clamp_series(series, lower=None, upper=None):
     s = series.copy()
@@ -145,6 +150,7 @@ def clamp_series(series, lower=None, upper=None):
     if upper is not None:
         s = s.clip(upper=upper)
     return s
+
 
 def get_resample_rule(unit: str, value: int) -> str:
     value = max(1, int(value))
@@ -160,10 +166,27 @@ def get_resample_rule(unit: str, value: int) -> str:
         return f"{value}ME"
     return "1h"
 
+
+def is_intraday_rule(rule: str) -> bool:
+    rule_lower = rule.lower()
+    return ("min" in rule_lower) or rule_lower.endswith("h")
+
+
 @st.cache_data(ttl=3600, show_spinner="正在重整 K 棒...")
-def resample_ohlcv(df: pd.DataFrame, rule: str, product_name: str) -> pd.DataFrame:
-    x = df.copy().sort_values("time")
-    x = x.set_index("time")
+def resample_ohlcv_session_aware(df: pd.DataFrame, rule: str, product_name: str) -> pd.DataFrame:
+    """
+    依連續交易區段分段 resample，避免把隔夜/休市時間硬接在一起。
+    對分鐘/小時K特別重要。
+    """
+    x = df.copy().sort_values("time").reset_index(drop=True)
+
+    if x.empty:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "amount", "product"])
+
+    # 用時間差判斷是否進入新的交易 session
+    # 只要 gap > 90 分鐘，就視為新 session
+    time_diff = x["time"].diff()
+    x["session_id"] = (time_diff > pd.Timedelta(minutes=90)).cumsum()
 
     agg = {
         "open": "first",
@@ -175,11 +198,35 @@ def resample_ohlcv(df: pd.DataFrame, rule: str, product_name: str) -> pd.DataFra
     if "amount" in x.columns:
         agg["amount"] = "sum"
 
-    out = x.resample(rule).agg(agg).dropna(subset=["open", "high", "low", "close"]).reset_index()
+    result_parts = []
+
+    if is_intraday_rule(rule):
+        # 分 session resample，避免跨夜壓縮
+        for _, g in x.groupby("session_id", sort=False):
+            g = g.copy().set_index("time")
+            rs = g.resample(rule, origin=g.index.min()).agg(agg)
+            rs = rs.dropna(subset=["open", "high", "low", "close"]).reset_index()
+            if not rs.empty:
+                result_parts.append(rs)
+    else:
+        # 日/週/月直接 resample
+        x2 = x.set_index("time")
+        rs = x2.resample(rule).agg(agg)
+        rs = rs.dropna(subset=["open", "high", "low", "close"]).reset_index()
+        if not rs.empty:
+            result_parts.append(rs)
+
+    if result_parts:
+        out = pd.concat(result_parts, ignore_index=True)
+    else:
+        out = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "amount"])
+
     out["product"] = product_name
     if "amount" not in out.columns:
         out["amount"] = 0
+
     return out
+
 
 # =========================================================
 # 指標
@@ -188,9 +235,11 @@ def calc_ma(df, period=10):
     period = ensure_positive_int(period, 10)
     return df["close"].rolling(window=period, min_periods=period).mean()
 
+
 def calc_ema(df, period=10):
     period = ensure_positive_int(period, 10)
     return df["close"].ewm(span=period, adjust=False).mean()
+
 
 def calc_rsi(df, period=14):
     period = ensure_positive_int(period, 14)
@@ -201,6 +250,7 @@ def calc_rsi(df, period=14):
     rsi = 100 - (100 / (1 + rs))
     return clamp_series(rsi, 0, 100)
 
+
 def calc_bb(df, period=20, num_std_dev=2.0):
     period = ensure_positive_int(period, 20)
     sma = df["close"].rolling(window=period, min_periods=period).mean()
@@ -208,6 +258,7 @@ def calc_bb(df, period=20, num_std_dev=2.0):
     upper = sma + std * num_std_dev
     lower = sma - std * num_std_dev
     return sma, upper, lower, std
+
 
 def calc_macd(df, fast_period=12, slow_period=26, signal_period=9):
     fast_period = ensure_positive_int(fast_period, 12)
@@ -220,6 +271,7 @@ def calc_macd(df, fast_period=12, slow_period=26, signal_period=9):
     hist = macd - signal
     return ema_fast, ema_slow, macd, signal, hist
 
+
 def calc_atr(df, period=14):
     period = ensure_positive_int(period, 14)
     high_low = df["high"] - df["low"]
@@ -229,9 +281,11 @@ def calc_atr(df, period=14):
     atr = tr.rolling(window=period, min_periods=period).mean()
     return atr
 
+
 def calc_obv(df):
     direction = np.sign(df["close"].diff()).fillna(0)
     return (direction * df["volume"]).fillna(0).cumsum()
+
 
 def calc_cci(df, period=20):
     period = ensure_positive_int(period, 20)
@@ -240,6 +294,7 @@ def calc_cci(df, period=20):
     mad = tp.rolling(period, min_periods=period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
     cci = (tp - sma) / (0.015 * mad.replace(0, np.nan))
     return cci
+
 
 def calc_kd(df, k_period=14, d_period=3):
     k_period = ensure_positive_int(k_period, 14)
@@ -252,12 +307,14 @@ def calc_kd(df, k_period=14, d_period=3):
     d = k.ewm(alpha=1 / d_period, adjust=False).mean()
     return clamp_series(k, 0, 100), clamp_series(d, 0, 100)
 
+
 def calc_willr(df, period=14):
     period = ensure_positive_int(period, 14)
     high_max = df["high"].rolling(window=period, min_periods=period).max()
     low_min = df["low"].rolling(window=period, min_periods=period).min()
     willr = -100 * (high_max - df["close"]) / (high_max - low_min).replace(0, np.nan)
     return clamp_series(willr, -100, 0)
+
 
 def calc_mfi(df, period=14):
     period = ensure_positive_int(period, 14)
@@ -269,13 +326,16 @@ def calc_mfi(df, period=14):
     mfi = 100 - (100 / (1 + mfr))
     return clamp_series(mfi, 0, 100)
 
+
 def calc_roc(df, period=12):
     period = ensure_positive_int(period, 12)
     return ((df["close"] - df["close"].shift(period)) / df["close"].shift(period)) * 100
 
+
 def calc_mom(df, period=10):
     period = ensure_positive_int(period, 10)
     return df["close"] - df["close"].shift(period)
+
 
 def calc_trix(df, period=15):
     period = ensure_positive_int(period, 15)
@@ -283,6 +343,7 @@ def calc_trix(df, period=15):
     ema2 = ema1.ewm(span=period, adjust=False).mean()
     ema3 = ema2.ewm(span=period, adjust=False).mean()
     return 100 * (ema3 - ema3.shift()) / ema3.shift()
+
 
 def calc_psar(df, af_start=0.02, af_step=0.02, af_max=0.2):
     high = df["high"].values
@@ -324,9 +385,11 @@ def calc_psar(df, af_start=0.02, af_step=0.02, af_max=0.2):
 
     return pd.Series(psar, index=df.index)
 
+
 def calc_vwap(df):
     pv = ((df["high"] + df["low"] + df["close"]) / 3) * df["volume"]
     return pv.cumsum() / df["volume"].replace(0, np.nan).cumsum()
+
 
 def calc_donchian(df, period=20):
     period = ensure_positive_int(period, 20)
@@ -334,6 +397,7 @@ def calc_donchian(df, period=20):
     lower = df["low"].rolling(period, min_periods=period).min()
     middle = (upper + lower) / 2
     return upper, middle, lower
+
 
 def calc_adx(df, period=14):
     period = ensure_positive_int(period, 14)
@@ -358,6 +422,7 @@ def calc_adx(df, period=14):
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     adx = dx.rolling(period, min_periods=period).mean()
     return clamp_series(adx, 0, 100), plus_di, minus_di
+
 
 def add_all_indicators(df, params):
     data = df.copy()
@@ -398,6 +463,7 @@ def add_all_indicators(df, params):
     data["ADX"], data["PLUS_DI"], data["MINUS_DI"] = calc_adx(data, params["adx_period"])
     return data
 
+
 # =========================================================
 # 回測
 # =========================================================
@@ -417,6 +483,7 @@ def close_trade(position, exit_time, exit_price, reason):
         "pnl": pnl,
         "reason": reason
     }
+
 
 def calculate_performance(trades, choice):
     if not trades:
@@ -453,8 +520,10 @@ def calculate_performance(trades, choice):
         ]
     })
 
+
 def performance_to_dict(perf_df: pd.DataFrame) -> dict:
     return dict(zip(perf_df["項目"], perf_df["數值"]))
+
 
 def backtest_strategy(df, strategy_name, params):
     data = df.copy().reset_index(drop=True)
@@ -634,6 +703,7 @@ def backtest_strategy(df, strategy_name, params):
         })
 
     return trades, signals
+
 
 # =========================================================
 # 最佳化
@@ -819,9 +889,44 @@ def optimize_strategy(base_df, strategy_name, base_indicator_params, base_backte
     results_df = results_df.sort_values("_score", ascending=False, na_position="last").reset_index(drop=True)
     return results_df
 
+
 # =========================================================
 # 圖表
 # =========================================================
+def build_rangebreaks(df: pd.DataFrame):
+    """
+    讓 Plotly 忽略長空窗，避免主圖只縮在一小段。
+    """
+    if df.empty or len(df) < 2:
+        return []
+
+    diffs = df["time"].sort_values().diff().dropna()
+    if diffs.empty:
+        return []
+
+    median_gap = diffs.median()
+    if pd.isna(median_gap) or median_gap <= pd.Timedelta(0):
+        return []
+
+    # 抓出明顯大於平常K棒間距的空窗
+    big_gaps = diffs[diffs > median_gap * 3]
+    if big_gaps.empty:
+        return []
+
+    sorted_times = df["time"].sort_values().reset_index(drop=True)
+    breaks = []
+    for idx in big_gaps.index:
+        prev_pos = sorted_times.index.get_loc(idx - 1) if (idx - 1) in sorted_times.index else None
+        curr_pos = sorted_times.index.get_loc(idx) if idx in sorted_times.index else None
+        if prev_pos is None or curr_pos is None:
+            continue
+        start_gap = sorted_times.iloc[prev_pos]
+        end_gap = sorted_times.iloc[curr_pos]
+        breaks.append(dict(bounds=[start_gap, end_gap]))
+
+    return breaks
+
+
 def create_main_chart(df, overlays, signals=None):
     fig = make_subplots(
         rows=2, cols=1,
@@ -898,6 +1003,8 @@ def create_main_chart(df, overlays, signals=None):
                 marker=dict(symbol="triangle-down", size=12, color="red")
             ), row=1, col=1)
 
+    rangebreaks = build_rangebreaks(df)
+
     fig.update_layout(
         height=760,
         xaxis_rangeslider_visible=True,
@@ -905,7 +1012,13 @@ def create_main_chart(df, overlays, signals=None):
         template="plotly_white",
         margin=dict(l=20, r=20, t=30, b=20)
     )
+
+    if rangebreaks:
+        fig.update_xaxes(rangebreaks=rangebreaks, row=1, col=1)
+        fig.update_xaxes(rangebreaks=rangebreaks, row=2, col=1)
+
     return fig
+
 
 def create_indicator_chart(df, indicator_name):
     fig = go.Figure()
@@ -978,6 +1091,7 @@ def create_indicator_chart(df, indicator_name):
     )
     return fig
 
+
 def create_equity_curve(trades, choice):
     multiplier = contract_multipliers.get(choice, 1)
     if not trades:
@@ -995,6 +1109,7 @@ def create_equity_curve(trades, choice):
         margin=dict(l=20, r=20, t=30, b=20)
     )
     return fig
+
 
 # =========================================================
 # 左側控制區
@@ -1102,6 +1217,7 @@ with st.sidebar:
     run_backtest = st.button("開始回測", use_container_width=True)
     run_optimize = st.button("開始最佳化", use_container_width=True)
 
+
 # =========================================================
 # 資料處理
 # =========================================================
@@ -1114,12 +1230,13 @@ if df_filtered.empty:
     st.stop()
 
 rule = get_resample_rule(timeframe_mode, tf_value)
-kbar_df = resample_ohlcv(df_filtered, rule, product_name)
+kbar_df = resample_ohlcv_session_aware(df_filtered, rule, product_name)
 
 if len(kbar_df) < 10:
     st.warning("重整後 K 棒太少，請縮短週期或增加日期範圍。")
 
 indicator_df = add_all_indicators(kbar_df, params)
+
 
 # =========================================================
 # 主畫面
@@ -1145,7 +1262,7 @@ with left_col:
     checks.append("ADX 正常" if indicator_df["ADX"].dropna().between(0, 100).all() else "ADX 超出範圍")
     for c in checks:
         st.write(f"- {c}")
-    st.markdown('<div class="small-note">已加入自動最佳參數搜索，可直接挑出最佳參數組合。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-note">主圖已改成 session-aware K 線，不會再把休市空窗整段壓在一起。</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with right_col:
@@ -1244,7 +1361,6 @@ with right_col:
                 best_clean = {k: v for k, v in best_row.items() if k != "_score"}
                 st.json(best_clean)
 
-                # 用最佳參數做一次正式回測
                 best_indicator_params = params.copy()
                 best_backtest_params = backtest_params.copy()
 
