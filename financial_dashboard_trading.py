@@ -1262,7 +1262,7 @@ with left_col:
     checks.append("ADX 正常" if indicator_df["ADX"].dropna().between(0, 100).all() else "ADX 超出範圍")
     for c in checks:
         st.write(f"- {c}")
-    st.markdown('<div class="small-note">主圖已改成 session-aware K 線，不會再把休市空窗整段壓在一起。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-note">主圖已產生。</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with right_col:
