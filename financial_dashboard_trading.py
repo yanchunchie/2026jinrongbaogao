@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 
 
-import json
-import math
+import itertools
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -183,7 +182,7 @@ def resample_ohlcv(df: pd.DataFrame, rule: str, product_name: str) -> pd.DataFra
     return out
 
 # =========================================================
-# 技術指標
+# 指標
 # =========================================================
 def calc_ma(df, period=10):
     period = ensure_positive_int(period, 10)
@@ -232,8 +231,7 @@ def calc_atr(df, period=14):
 
 def calc_obv(df):
     direction = np.sign(df["close"].diff()).fillna(0)
-    obv = (direction * df["volume"]).fillna(0).cumsum()
-    return obv
+    return (direction * df["volume"]).fillna(0).cumsum()
 
 def calc_cci(df, period=20):
     period = ensure_positive_int(period, 20)
@@ -327,8 +325,8 @@ def calc_psar(df, af_start=0.02, af_step=0.02, af_max=0.2):
     return pd.Series(psar, index=df.index)
 
 def calc_vwap(df):
-    price_volume = ((df["high"] + df["low"] + df["close"]) / 3) * df["volume"]
-    return price_volume.cumsum() / df["volume"].replace(0, np.nan).cumsum()
+    pv = ((df["high"] + df["low"] + df["close"]) / 3) * df["volume"]
+    return pv.cumsum() / df["volume"].replace(0, np.nan).cumsum()
 
 def calc_donchian(df, period=20):
     period = ensure_positive_int(period, 20)
@@ -363,7 +361,6 @@ def calc_adx(df, period=14):
 
 def add_all_indicators(df, params):
     data = df.copy()
-
     data["MA_short"] = calc_ma(data, params["ma_short"])
     data["MA_long"] = calc_ma(data, params["ma_long"])
     data["EMA_short"] = calc_ema(data, params["ema_short"])
@@ -399,14 +396,27 @@ def add_all_indicators(df, params):
     data["VWAP"] = calc_vwap(data)
     data["DON_UPPER"], data["DON_MID"], data["DON_LOWER"] = calc_donchian(data, params["donchian_period"])
     data["ADX"], data["PLUS_DI"], data["MINUS_DI"] = calc_adx(data, params["adx_period"])
-
     return data
 
 # =========================================================
-# 回測引擎
+# 回測
 # =========================================================
-def mark_to_market_equity(equity_curve, current_equity):
-    equity_curve.append(current_equity)
+def close_trade(position, exit_time, exit_price, reason):
+    if position["side"] == "long":
+        pnl = (exit_price - position["entry_price"]) * position["qty"]
+    else:
+        pnl = (position["entry_price"] - exit_price) * position["qty"]
+
+    return {
+        "side": position["side"],
+        "entry_time": position["entry_time"],
+        "entry_price": position["entry_price"],
+        "exit_time": exit_time,
+        "exit_price": exit_price,
+        "qty": position["qty"],
+        "pnl": pnl,
+        "reason": reason
+    }
 
 def calculate_performance(trades, choice):
     if not trades:
@@ -443,23 +453,8 @@ def calculate_performance(trades, choice):
         ]
     })
 
-def close_trade(position, exit_time, exit_price, reason):
-    pnl = 0.0
-    if position["side"] == "long":
-        pnl = (exit_price - position["entry_price"]) * position["qty"]
-    else:
-        pnl = (position["entry_price"] - exit_price) * position["qty"]
-
-    return {
-        "side": position["side"],
-        "entry_time": position["entry_time"],
-        "entry_price": position["entry_price"],
-        "exit_time": exit_time,
-        "exit_price": exit_price,
-        "qty": position["qty"],
-        "pnl": pnl,
-        "reason": reason
-    }
+def performance_to_dict(perf_df: pd.DataFrame) -> dict:
+    return dict(zip(perf_df["項目"], perf_df["數值"]))
 
 def backtest_strategy(df, strategy_name, params):
     data = df.copy().reset_index(drop=True)
@@ -498,15 +493,6 @@ def backtest_strategy(df, strategy_name, params):
             )
         elif strategy_name == "網格交易策略":
             return False
-        elif strategy_name == "多策略組合":
-            score = 0
-            if pd.notna(data.loc[i, "MA_short"]) and pd.notna(data.loc[i, "MA_long"]) and data.loc[i, "MA_short"] > data.loc[i, "MA_long"]:
-                score += params["w_ma"]
-            if pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] < params["oversold"]:
-                score += params["w_rsi"]
-            if pd.notna(data.loc[i, "BB_LOWER"]) and data.loc[i, "close"] < data.loc[i, "BB_LOWER"]:
-                score += params["w_bb"]
-            return score >= params["buy_threshold"]
         return False
 
     def sell_signal(i):
@@ -536,18 +522,9 @@ def backtest_strategy(df, strategy_name, params):
             )
         elif strategy_name == "網格交易策略":
             return False
-        elif strategy_name == "多策略組合":
-            score = 0
-            if pd.notna(data.loc[i, "MA_short"]) and pd.notna(data.loc[i, "MA_long"]) and data.loc[i, "MA_short"] < data.loc[i, "MA_long"]:
-                score += params["w_ma"]
-            if pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] > params["overbought"]:
-                score += params["w_rsi"]
-            if pd.notna(data.loc[i, "BB_UPPER"]) and data.loc[i, "close"] > data.loc[i, "BB_UPPER"]:
-                score += params["w_bb"]
-            return score >= params["sell_threshold"]
         return False
 
-    # 網格交易單獨處理
+    # 網格交易
     if strategy_name == "網格交易策略":
         base_price = float(data.loc[0, "close"])
         grid_pct = params["grid_pct"]
@@ -557,13 +534,11 @@ def backtest_strategy(df, strategy_name, params):
         sell_levels = [base_price + (i + 1) * grid_size for i in range(max_layers)]
 
         open_positions = []
-
         for i in range(1, len(data) - 1):
             price = float(data.loc[i, "close"])
             next_open = float(data.loc[i + 1, "open"])
             next_time = data.loc[i + 1, "time"]
 
-            # 分層買入
             for lvl_idx, lvl in enumerate(buy_levels):
                 if price <= lvl and len(open_positions) <= lvl_idx:
                     open_positions.append({
@@ -579,11 +554,9 @@ def backtest_strategy(df, strategy_name, params):
                         "label": f"網格買 {lvl_idx+1}"
                     })
 
-            # 分層賣出
             while open_positions and price >= sell_levels[len(open_positions) - 1]:
                 pos = open_positions.pop()
-                trade = close_trade(pos, next_time, next_open, "grid_take_profit")
-                trades.append(trade)
+                trades.append(close_trade(pos, next_time, next_open, "grid_take_profit"))
                 signals.append({
                     "time": next_time,
                     "price": next_open,
@@ -591,7 +564,6 @@ def backtest_strategy(df, strategy_name, params):
                     "label": "網格賣"
                 })
 
-        # 最後平倉
         if open_positions:
             final_time = data.loc[len(data) - 1, "time"]
             final_price = float(data.loc[len(data) - 1, "close"])
@@ -636,20 +608,16 @@ def backtest_strategy(df, strategy_name, params):
         else:
             if position["side"] == "long":
                 stop_price = max(stop_price, current_close - stop_loss)
-                exit_cond = sell_signal(i) or current_close < stop_price
-                if exit_cond:
-                    trade = close_trade(position, next_time, next_open, "long_exit")
-                    trades.append(trade)
+                if sell_signal(i) or current_close < stop_price:
+                    trades.append(close_trade(position, next_time, next_open, "long_exit"))
                     signals.append({"time": next_time, "price": next_open, "type": "sell", "label": "平多"})
                     position = None
                     stop_price = None
 
             elif position["side"] == "short":
                 stop_price = min(stop_price, current_close + stop_loss)
-                exit_cond = buy_signal(i) or current_close > stop_price
-                if exit_cond:
-                    trade = close_trade(position, next_time, next_open, "short_exit")
-                    trades.append(trade)
+                if buy_signal(i) or current_close > stop_price:
+                    trades.append(close_trade(position, next_time, next_open, "short_exit"))
                     signals.append({"time": next_time, "price": next_open, "type": "buy", "label": "平空"})
                     position = None
                     stop_price = None
@@ -657,8 +625,7 @@ def backtest_strategy(df, strategy_name, params):
     if position is not None:
         final_time = data.loc[len(data) - 1, "time"]
         final_price = float(data.loc[len(data) - 1, "close"])
-        trade = close_trade(position, final_time, final_price, "final_close")
-        trades.append(trade)
+        trades.append(close_trade(position, final_time, final_price, "final_close"))
         signals.append({
             "time": final_time,
             "price": final_price,
@@ -669,7 +636,191 @@ def backtest_strategy(df, strategy_name, params):
     return trades, signals
 
 # =========================================================
-# 圖表函式
+# 最佳化
+# =========================================================
+def optimize_strategy(base_df, strategy_name, base_indicator_params, base_backtest_params, choice, optimize_metric):
+    results = []
+
+    def metric_value(perf_dict, metric_name):
+        val = perf_dict.get(metric_name, np.nan)
+        if pd.isna(val):
+            return -np.inf
+        return val
+
+    if strategy_name == "移動平均線策略":
+        short_candidates = [3, 5, 8, 10, 12]
+        long_candidates = [15, 20, 30, 50, 80]
+
+        for ma_s, ma_l in itertools.product(short_candidates, long_candidates):
+            if ma_s >= ma_l:
+                continue
+
+            indicator_params = base_indicator_params.copy()
+            indicator_params["ma_short"] = ma_s
+            indicator_params["ma_long"] = ma_l
+
+            df2 = add_all_indicators(base_df, indicator_params)
+            trades, _ = backtest_strategy(df2, strategy_name, base_backtest_params)
+            perf_df = calculate_performance(trades, choice)
+            perf_dict = performance_to_dict(perf_df)
+
+            results.append({
+                "ma_short": ma_s,
+                "ma_long": ma_l,
+                "交易數": perf_dict["交易數"],
+                "總盈虧": perf_dict["總盈虧"],
+                "勝率": perf_dict["勝率"],
+                "報酬風險比": perf_dict["報酬風險比"],
+                "_score": metric_value(perf_dict, optimize_metric)
+            })
+
+    elif strategy_name == "RSI逆勢策略":
+        rsi_periods = [6, 10, 14, 21]
+        oversolds = [20, 25, 30]
+        overboughts = [70, 75, 80]
+
+        for rsi_p, osd, obd in itertools.product(rsi_periods, oversolds, overboughts):
+            bt = base_backtest_params.copy()
+            ind = base_indicator_params.copy()
+            ind["rsi_period"] = rsi_p
+
+            bt["oversold"] = osd
+            bt["overbought"] = obd
+
+            df2 = add_all_indicators(base_df, ind)
+            trades, _ = backtest_strategy(df2, strategy_name, bt)
+            perf_df = calculate_performance(trades, choice)
+            perf_dict = performance_to_dict(perf_df)
+
+            results.append({
+                "rsi_period": rsi_p,
+                "oversold": osd,
+                "overbought": obd,
+                "交易數": perf_dict["交易數"],
+                "總盈虧": perf_dict["總盈虧"],
+                "勝率": perf_dict["勝率"],
+                "報酬風險比": perf_dict["報酬風險比"],
+                "_score": metric_value(perf_dict, optimize_metric)
+            })
+
+    elif strategy_name == "布林通道策略":
+        bb_periods = [10, 15, 20, 25, 30]
+        bb_stds = [1.5, 2.0, 2.5, 3.0]
+
+        for bb_p, bb_s in itertools.product(bb_periods, bb_stds):
+            ind = base_indicator_params.copy()
+            ind["bb_period"] = bb_p
+            ind["bb_std"] = bb_s
+
+            df2 = add_all_indicators(base_df, ind)
+            trades, _ = backtest_strategy(df2, strategy_name, base_backtest_params)
+            perf_df = calculate_performance(trades, choice)
+            perf_dict = performance_to_dict(perf_df)
+
+            results.append({
+                "bb_period": bb_p,
+                "bb_std": bb_s,
+                "交易數": perf_dict["交易數"],
+                "總盈虧": perf_dict["總盈虧"],
+                "勝率": perf_dict["勝率"],
+                "報酬風險比": perf_dict["報酬風險比"],
+                "_score": metric_value(perf_dict, optimize_metric)
+            })
+
+    elif strategy_name == "MACD策略":
+        fasts = [6, 8, 12]
+        slows = [19, 26, 35]
+        signals = [5, 9, 12]
+
+        for f, s, sig in itertools.product(fasts, slows, signals):
+            if f >= s:
+                continue
+
+            ind = base_indicator_params.copy()
+            ind["macd_fast"] = f
+            ind["macd_slow"] = s
+            ind["macd_signal"] = sig
+
+            df2 = add_all_indicators(base_df, ind)
+            trades, _ = backtest_strategy(df2, strategy_name, base_backtest_params)
+            perf_df = calculate_performance(trades, choice)
+            perf_dict = performance_to_dict(perf_df)
+
+            results.append({
+                "macd_fast": f,
+                "macd_slow": s,
+                "macd_signal": sig,
+                "交易數": perf_dict["交易數"],
+                "總盈虧": perf_dict["總盈虧"],
+                "勝率": perf_dict["勝率"],
+                "報酬風險比": perf_dict["報酬風險比"],
+                "_score": metric_value(perf_dict, optimize_metric)
+            })
+
+    elif strategy_name == "KD策略":
+        k_periods = [5, 9, 14, 21]
+        d_periods = [3, 5, 7]
+        oversolds = [15, 20, 25]
+        overboughts = [75, 80, 85]
+
+        for kp, dp, osd, obd in itertools.product(k_periods, d_periods, oversolds, overboughts):
+            ind = base_indicator_params.copy()
+            bt = base_backtest_params.copy()
+
+            ind["k_period"] = kp
+            ind["d_period"] = dp
+            bt["oversold"] = osd
+            bt["overbought"] = obd
+
+            df2 = add_all_indicators(base_df, ind)
+            trades, _ = backtest_strategy(df2, strategy_name, bt)
+            perf_df = calculate_performance(trades, choice)
+            perf_dict = performance_to_dict(perf_df)
+
+            results.append({
+                "k_period": kp,
+                "d_period": dp,
+                "oversold": osd,
+                "overbought": obd,
+                "交易數": perf_dict["交易數"],
+                "總盈虧": perf_dict["總盈虧"],
+                "勝率": perf_dict["勝率"],
+                "報酬風險比": perf_dict["報酬風險比"],
+                "_score": metric_value(perf_dict, optimize_metric)
+            })
+
+    elif strategy_name == "網格交易策略":
+        grid_pcts = [0.005, 0.01, 0.015, 0.02, 0.03]
+        layers = [3, 5, 7, 10]
+
+        for gp, ml in itertools.product(grid_pcts, layers):
+            bt = base_backtest_params.copy()
+            bt["grid_pct"] = gp
+            bt["max_layers"] = ml
+
+            trades, _ = backtest_strategy(base_df, strategy_name, bt)
+            perf_df = calculate_performance(trades, choice)
+            perf_dict = performance_to_dict(perf_df)
+
+            results.append({
+                "grid_pct": gp,
+                "max_layers": ml,
+                "交易數": perf_dict["交易數"],
+                "總盈虧": perf_dict["總盈虧"],
+                "勝率": perf_dict["勝率"],
+                "報酬風險比": perf_dict["報酬風險比"],
+                "_score": metric_value(perf_dict, optimize_metric)
+            })
+
+    results_df = pd.DataFrame(results)
+    if results_df.empty:
+        return results_df
+
+    results_df = results_df.sort_values("_score", ascending=False, na_position="last").reset_index(drop=True)
+    return results_df
+
+# =========================================================
+# 圖表
 # =========================================================
 def create_main_chart(df, overlays, signals=None):
     fig = make_subplots(
@@ -692,11 +843,7 @@ def create_main_chart(df, overlays, signals=None):
     )
 
     fig.add_trace(
-        go.Bar(
-            x=df["time"],
-            y=df["volume"],
-            name="成交量"
-        ),
+        go.Bar(x=df["time"], y=df["volume"], name="成交量"),
         row=2, col=1
     )
 
@@ -718,18 +865,13 @@ def create_main_chart(df, overlays, signals=None):
 
     if overlays.get("psar"):
         fig.add_trace(go.Scatter(
-            x=df["time"],
-            y=df["PSAR"],
-            mode="markers",
-            name="PSAR",
-            marker=dict(size=5)
+            x=df["time"], y=df["PSAR"], mode="markers", name="PSAR", marker=dict(size=5)
         ), row=1, col=1)
 
     if overlays.get("donchian"):
         fig.add_trace(go.Scatter(x=df["time"], y=df["DON_UPPER"], mode="lines", name="Donchian上"), row=1, col=1)
         fig.add_trace(go.Scatter(x=df["time"], y=df["DON_LOWER"], mode="lines", name="Donchian下"), row=1, col=1)
 
-    # 買賣點
     if signals:
         buy_signals = [s for s in signals if s["type"] == "buy"]
         sell_signals = [s for s in signals if s["type"] == "sell"]
@@ -928,8 +1070,7 @@ with st.sidebar:
             "布林通道策略",
             "MACD策略",
             "KD策略",
-            "網格交易策略",
-            "多策略組合"
+            "網格交易策略"
         ],
         index=0
     )
@@ -941,14 +1082,25 @@ with st.sidebar:
         "overbought": st.slider("超買", 50, 99, 70),
         "grid_pct": st.slider("網格間距 (%)", 0.1, 10.0, 2.0, 0.1) / 100.0,
         "max_layers": st.slider("網格最大層數", 1, 20, 5),
-        "buy_threshold": st.slider("買入分數門檻", 0.0, 2.0, 0.8, 0.05),
-        "sell_threshold": st.slider("賣出分數門檻", 0.0, 2.0, 0.8, 0.05),
-        "w_ma": st.slider("MA 權重", 0.0, 1.0, 0.4, 0.05),
-        "w_rsi": st.slider("RSI 權重", 0.0, 1.0, 0.3, 0.05),
-        "w_bb": st.slider("BB 權重", 0.0, 1.0, 0.3, 0.05),
+        "buy_threshold": 0.8,
+        "sell_threshold": 0.8,
+        "w_ma": 0.4,
+        "w_rsi": 0.3,
+        "w_bb": 0.3,
     }
 
+    st.markdown("---")
+    st.subheader("最佳化")
+    enable_optimization = st.checkbox("啟用自動最佳參數搜索", value=False)
+    optimize_metric = st.selectbox(
+        "最佳化目標",
+        ["總盈虧", "報酬風險比", "勝率"],
+        index=0
+    )
+    top_n_show = st.slider("顯示前幾組結果", 5, 30, 10)
+
     run_backtest = st.button("開始回測", use_container_width=True)
+    run_optimize = st.button("開始最佳化", use_container_width=True)
 
 # =========================================================
 # 資料處理
@@ -957,7 +1109,6 @@ start_ts = pd.to_datetime(start_date)
 end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
 
 df_filtered = df_original[(df_original["time"] >= start_ts) & (df_original["time"] <= end_ts)].copy()
-
 if df_filtered.empty:
     st.error("目前選擇區間沒有資料。")
     st.stop()
@@ -971,7 +1122,7 @@ if len(kbar_df) < 10:
 indicator_df = add_all_indicators(kbar_df, params)
 
 # =========================================================
-# 右邊兩頁版面
+# 主畫面
 # =========================================================
 left_col, right_col = st.columns([1, 2.5], gap="large")
 
@@ -994,11 +1145,11 @@ with left_col:
     checks.append("ADX 正常" if indicator_df["ADX"].dropna().between(0, 100).all() else "ADX 超出範圍")
     for c in checks:
         st.write(f"- {c}")
-    st.markdown('<div class="small-note">新增：VWAP、Donchian、ADX；主頁直接 K 線；可畫買賣點。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-note">已加入自動最佳參數搜索，可直接挑出最佳參數組合。</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with right_col:
-    tab_basic, tab_backtest = st.tabs(["基本圖表", "回測分析"])
+    tab_basic, tab_backtest, tab_optimize = st.tabs(["基本圖表", "回測分析", "最佳化"])
 
     with tab_basic:
         st.subheader("主頁 K 線圖")
@@ -1064,6 +1215,67 @@ with right_col:
                 )
             else:
                 st.warning("沒有產生交易紀錄，請調整策略或參數。")
-
         else:
             st.info("請先在左邊設定參數後按「開始回測」。")
+
+    with tab_optimize:
+        st.subheader("自動最佳參數搜索")
+
+        if enable_optimization and run_optimize:
+            with st.spinner("最佳化中，請稍候..."):
+                optimize_df = optimize_strategy(
+                    base_df=kbar_df,
+                    strategy_name=strategy_choice,
+                    base_indicator_params=params,
+                    base_backtest_params=backtest_params,
+                    choice=choice,
+                    optimize_metric=optimize_metric
+                )
+
+            if optimize_df.empty:
+                st.warning("沒有產生最佳化結果。")
+            else:
+                st.success("最佳化完成")
+                st.dataframe(optimize_df.head(top_n_show).drop(columns=["_score"]), use_container_width=True)
+
+                best_row = optimize_df.iloc[0].to_dict()
+                st.subheader("最佳參數")
+
+                best_clean = {k: v for k, v in best_row.items() if k != "_score"}
+                st.json(best_clean)
+
+                # 用最佳參數做一次正式回測
+                best_indicator_params = params.copy()
+                best_backtest_params = backtest_params.copy()
+
+                for k in ["ma_short", "ma_long", "rsi_period", "bb_period", "bb_std", "macd_fast", "macd_slow", "macd_signal", "k_period", "d_period"]:
+                    if k in best_row and pd.notna(best_row[k]):
+                        best_indicator_params[k] = best_row[k]
+
+                for k in ["oversold", "overbought", "grid_pct", "max_layers"]:
+                    if k in best_row and pd.notna(best_row[k]):
+                        best_backtest_params[k] = best_row[k]
+
+                best_df = add_all_indicators(kbar_df, best_indicator_params)
+                best_trades, best_signals = backtest_strategy(best_df, strategy_choice, best_backtest_params)
+
+                st.subheader("最佳參數回測圖")
+                best_fig = create_main_chart(
+                    best_df,
+                    overlays={
+                        "ma": overlay_ma,
+                        "ema": overlay_ema,
+                        "bb": overlay_bb,
+                        "vwap": overlay_vwap,
+                        "psar": overlay_psar,
+                        "donchian": overlay_donchian
+                    },
+                    signals=best_signals
+                )
+                st.plotly_chart(best_fig, use_container_width=True)
+
+                best_perf_df = calculate_performance(best_trades, choice)
+                st.subheader("最佳參數績效")
+                st.dataframe(best_perf_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("左側勾選「啟用自動最佳參數搜索」，再按「開始最佳化」。")
