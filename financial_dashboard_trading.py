@@ -58,6 +58,14 @@ st.markdown("""
         color: #7d6a2d;
         font-size: 0.9rem;
     }
+    .indicator-help-box {
+        background: #fffdf2;
+        border-left: 5px solid #e7c96d;
+        padding: 12px 14px;
+        border-radius: 8px;
+        margin: 8px 0 12px 0;
+        color: #5e4b11;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -67,6 +75,77 @@ st.markdown("""
     <h3>Financial Dashboard and Program Trading</h3>
 </div>
 """, unsafe_allow_html=True)
+
+# =========================================================
+# 指標說明
+# =========================================================
+INDICATOR_INFO = {
+    "RSI": {
+        "title": "RSI 相對強弱指標",
+        "desc": "用來衡量價格近期上漲與下跌的強弱，常用來判斷市場是否過熱或過冷。",
+        "rule": "常見判讀：70 以上偏強或偏熱，30 以下偏弱或偏低。"
+    },
+    "MACD": {
+        "title": "MACD 指數平滑異同移動平均",
+        "desc": "用來觀察趨勢方向與動能變化，常看 MACD 線與訊號線的黃金交叉、死亡交叉。",
+        "rule": "常見判讀：MACD 上穿訊號線偏多，下穿訊號線偏空。"
+    },
+    "ATR": {
+        "title": "ATR 平均真實波幅",
+        "desc": "用來衡量波動度大小，不直接判斷多空，但很適合拿來設停損與部位控管。",
+        "rule": "常見判讀：ATR 越大代表波動越大，ATR 越小代表行情較平穩。"
+    },
+    "OBV": {
+        "title": "OBV 能量潮",
+        "desc": "把成交量與價格方向結合，用來觀察量價是否同步。",
+        "rule": "常見判讀：OBV 上升且價格上升，代表量價配合較佳。"
+    },
+    "CCI": {
+        "title": "CCI 商品通道指標",
+        "desc": "衡量價格是否偏離平均水準，常用來觀察超買超賣。",
+        "rule": "常見判讀：+100 以上偏強，-100 以下偏弱。"
+    },
+    "KD": {
+        "title": "KD 隨機指標",
+        "desc": "觀察價格在一段期間內相對高低位置，常用來找轉折。",
+        "rule": "常見判讀：80 以上偏高，20 以下偏低；K 上穿 D 常視為偏多訊號。"
+    },
+    "WILLR": {
+        "title": "WILLR 威廉指標",
+        "desc": "與 KD 類似，用來觀察價格在近期區間中的相對位置。",
+        "rule": "常見判讀：-20 以上偏強或偏熱，-80 以下偏弱或偏低。"
+    },
+    "MFI": {
+        "title": "MFI 資金流量指標",
+        "desc": "結合價格與成交量，觀察資金流入流出強弱。",
+        "rule": "常見判讀：80 以上偏熱，20 以下偏冷。"
+    },
+    "ROC": {
+        "title": "ROC 變動率指標",
+        "desc": "衡量目前價格相對於過去價格的變動幅度，常用來看動能。",
+        "rule": "常見判讀：正值代表高於過去，負值代表低於過去。"
+    },
+    "MOM": {
+        "title": "MOM 動能指標",
+        "desc": "看目前價格比前幾期高多少或低多少，適合觀察價格加速或減速。",
+        "rule": "常見判讀：數值由負轉正，代表動能可能轉強。"
+    },
+    "TRIX": {
+        "title": "TRIX 三重平滑動能指標",
+        "desc": "用三重 EMA 平滑後觀察動能，能降低雜訊。",
+        "rule": "常見判讀：由下往上穿越 0 軸，常視為轉強訊號。"
+    },
+    "ADX": {
+        "title": "ADX 趨勢強度指標",
+        "desc": "用來衡量趨勢強不強，不直接分多空方向。",
+        "rule": "常見判讀：25 以上常視為趨勢明顯，越高代表趨勢越強。"
+    },
+    "BB_WIDTH": {
+        "title": "布林通道寬度",
+        "desc": "反映布林通道上下軌之間的距離，可用來觀察波動是否放大。",
+        "rule": "常見判讀：寬度縮小常代表盤整，寬度放大代表波動擴大。"
+    }
+}
 
 # =========================================================
 # 商品資料
@@ -134,14 +213,12 @@ def load_data(path: str) -> pd.DataFrame:
     df["time"] = pd.to_datetime(df["time"])
     return df
 
-
 def ensure_positive_int(value, default_value=1):
     try:
         value = int(value)
         return max(1, value)
     except Exception:
         return default_value
-
 
 def clamp_series(series, lower=None, upper=None):
     s = series.copy()
@@ -150,7 +227,6 @@ def clamp_series(series, lower=None, upper=None):
     if upper is not None:
         s = s.clip(upper=upper)
     return s
-
 
 def get_resample_rule(unit: str, value: int) -> str:
     value = max(1, int(value))
@@ -166,25 +242,17 @@ def get_resample_rule(unit: str, value: int) -> str:
         return f"{value}ME"
     return "1h"
 
-
 def is_intraday_rule(rule: str) -> bool:
     rule_lower = rule.lower()
     return ("min" in rule_lower) or rule_lower.endswith("h")
 
-
 @st.cache_data(ttl=3600, show_spinner="正在重整 K 棒...")
 def resample_ohlcv_session_aware(df: pd.DataFrame, rule: str, product_name: str) -> pd.DataFrame:
-    """
-    依連續交易區段分段 resample，避免把隔夜/休市時間硬接在一起。
-    對分鐘/小時K特別重要。
-    """
     x = df.copy().sort_values("time").reset_index(drop=True)
 
     if x.empty:
         return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "amount", "product"])
 
-    # 用時間差判斷是否進入新的交易 session
-    # 只要 gap > 90 分鐘，就視為新 session
     time_diff = x["time"].diff()
     x["session_id"] = (time_diff > pd.Timedelta(minutes=90)).cumsum()
 
@@ -201,7 +269,6 @@ def resample_ohlcv_session_aware(df: pd.DataFrame, rule: str, product_name: str)
     result_parts = []
 
     if is_intraday_rule(rule):
-        # 分 session resample，避免跨夜壓縮
         for _, g in x.groupby("session_id", sort=False):
             g = g.copy().set_index("time")
             rs = g.resample(rule, origin=g.index.min()).agg(agg)
@@ -209,7 +276,6 @@ def resample_ohlcv_session_aware(df: pd.DataFrame, rule: str, product_name: str)
             if not rs.empty:
                 result_parts.append(rs)
     else:
-        # 日/週/月直接 resample
         x2 = x.set_index("time")
         rs = x2.resample(rule).agg(agg)
         rs = rs.dropna(subset=["open", "high", "low", "close"]).reset_index()
@@ -227,7 +293,6 @@ def resample_ohlcv_session_aware(df: pd.DataFrame, rule: str, product_name: str)
 
     return out
 
-
 # =========================================================
 # 指標
 # =========================================================
@@ -235,11 +300,9 @@ def calc_ma(df, period=10):
     period = ensure_positive_int(period, 10)
     return df["close"].rolling(window=period, min_periods=period).mean()
 
-
 def calc_ema(df, period=10):
     period = ensure_positive_int(period, 10)
     return df["close"].ewm(span=period, adjust=False).mean()
-
 
 def calc_rsi(df, period=14):
     period = ensure_positive_int(period, 14)
@@ -250,7 +313,6 @@ def calc_rsi(df, period=14):
     rsi = 100 - (100 / (1 + rs))
     return clamp_series(rsi, 0, 100)
 
-
 def calc_bb(df, period=20, num_std_dev=2.0):
     period = ensure_positive_int(period, 20)
     sma = df["close"].rolling(window=period, min_periods=period).mean()
@@ -258,7 +320,6 @@ def calc_bb(df, period=20, num_std_dev=2.0):
     upper = sma + std * num_std_dev
     lower = sma - std * num_std_dev
     return sma, upper, lower, std
-
 
 def calc_macd(df, fast_period=12, slow_period=26, signal_period=9):
     fast_period = ensure_positive_int(fast_period, 12)
@@ -271,7 +332,6 @@ def calc_macd(df, fast_period=12, slow_period=26, signal_period=9):
     hist = macd - signal
     return ema_fast, ema_slow, macd, signal, hist
 
-
 def calc_atr(df, period=14):
     period = ensure_positive_int(period, 14)
     high_low = df["high"] - df["low"]
@@ -281,11 +341,9 @@ def calc_atr(df, period=14):
     atr = tr.rolling(window=period, min_periods=period).mean()
     return atr
 
-
 def calc_obv(df):
     direction = np.sign(df["close"].diff()).fillna(0)
     return (direction * df["volume"]).fillna(0).cumsum()
-
 
 def calc_cci(df, period=20):
     period = ensure_positive_int(period, 20)
@@ -294,7 +352,6 @@ def calc_cci(df, period=20):
     mad = tp.rolling(period, min_periods=period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
     cci = (tp - sma) / (0.015 * mad.replace(0, np.nan))
     return cci
-
 
 def calc_kd(df, k_period=14, d_period=3):
     k_period = ensure_positive_int(k_period, 14)
@@ -307,14 +364,12 @@ def calc_kd(df, k_period=14, d_period=3):
     d = k.ewm(alpha=1 / d_period, adjust=False).mean()
     return clamp_series(k, 0, 100), clamp_series(d, 0, 100)
 
-
 def calc_willr(df, period=14):
     period = ensure_positive_int(period, 14)
     high_max = df["high"].rolling(window=period, min_periods=period).max()
     low_min = df["low"].rolling(window=period, min_periods=period).min()
     willr = -100 * (high_max - df["close"]) / (high_max - low_min).replace(0, np.nan)
     return clamp_series(willr, -100, 0)
-
 
 def calc_mfi(df, period=14):
     period = ensure_positive_int(period, 14)
@@ -326,16 +381,13 @@ def calc_mfi(df, period=14):
     mfi = 100 - (100 / (1 + mfr))
     return clamp_series(mfi, 0, 100)
 
-
 def calc_roc(df, period=12):
     period = ensure_positive_int(period, 12)
     return ((df["close"] - df["close"].shift(period)) / df["close"].shift(period)) * 100
 
-
 def calc_mom(df, period=10):
     period = ensure_positive_int(period, 10)
     return df["close"] - df["close"].shift(period)
-
 
 def calc_trix(df, period=15):
     period = ensure_positive_int(period, 15)
@@ -343,7 +395,6 @@ def calc_trix(df, period=15):
     ema2 = ema1.ewm(span=period, adjust=False).mean()
     ema3 = ema2.ewm(span=period, adjust=False).mean()
     return 100 * (ema3 - ema3.shift()) / ema3.shift()
-
 
 def calc_psar(df, af_start=0.02, af_step=0.02, af_max=0.2):
     high = df["high"].values
@@ -385,11 +436,9 @@ def calc_psar(df, af_start=0.02, af_step=0.02, af_max=0.2):
 
     return pd.Series(psar, index=df.index)
 
-
 def calc_vwap(df):
     pv = ((df["high"] + df["low"] + df["close"]) / 3) * df["volume"]
     return pv.cumsum() / df["volume"].replace(0, np.nan).cumsum()
-
 
 def calc_donchian(df, period=20):
     period = ensure_positive_int(period, 20)
@@ -397,7 +446,6 @@ def calc_donchian(df, period=20):
     lower = df["low"].rolling(period, min_periods=period).min()
     middle = (upper + lower) / 2
     return upper, middle, lower
-
 
 def calc_adx(df, period=14):
     period = ensure_positive_int(period, 14)
@@ -422,7 +470,6 @@ def calc_adx(df, period=14):
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     adx = dx.rolling(period, min_periods=period).mean()
     return clamp_series(adx, 0, 100), plus_di, minus_di
-
 
 def add_all_indicators(df, params):
     data = df.copy()
@@ -463,7 +510,6 @@ def add_all_indicators(df, params):
     data["ADX"], data["PLUS_DI"], data["MINUS_DI"] = calc_adx(data, params["adx_period"])
     return data
 
-
 # =========================================================
 # 回測
 # =========================================================
@@ -483,7 +529,6 @@ def close_trade(position, exit_time, exit_price, reason):
         "pnl": pnl,
         "reason": reason
     }
-
 
 def calculate_performance(trades, choice):
     if not trades:
@@ -520,10 +565,8 @@ def calculate_performance(trades, choice):
         ]
     })
 
-
 def performance_to_dict(perf_df: pd.DataFrame) -> dict:
     return dict(zip(perf_df["項目"], perf_df["數值"]))
-
 
 def backtest_strategy(df, strategy_name, params):
     data = df.copy().reset_index(drop=True)
@@ -593,7 +636,6 @@ def backtest_strategy(df, strategy_name, params):
             return False
         return False
 
-    # 網格交易
     if strategy_name == "網格交易策略":
         base_price = float(data.loc[0, "close"])
         grid_pct = params["grid_pct"]
@@ -647,7 +689,6 @@ def backtest_strategy(df, strategy_name, params):
 
         return trades, signals
 
-    # 一般策略
     for i in range(2, len(data) - 1):
         next_open = float(data.loc[i + 1, "open"])
         next_time = data.loc[i + 1, "time"]
@@ -703,7 +744,6 @@ def backtest_strategy(df, strategy_name, params):
         })
 
     return trades, signals
-
 
 # =========================================================
 # 最佳化
@@ -889,18 +929,15 @@ def optimize_strategy(base_df, strategy_name, base_indicator_params, base_backte
     results_df = results_df.sort_values("_score", ascending=False, na_position="last").reset_index(drop=True)
     return results_df
 
-
 # =========================================================
 # 圖表
 # =========================================================
 def build_rangebreaks(df: pd.DataFrame):
-    """
-    讓 Plotly 忽略長空窗，避免主圖只縮在一小段。
-    """
     if df.empty or len(df) < 2:
         return []
 
-    diffs = df["time"].sort_values().diff().dropna()
+    times = df["time"].sort_values().reset_index(drop=True)
+    diffs = times.diff().dropna()
     if diffs.empty:
         return []
 
@@ -908,24 +945,15 @@ def build_rangebreaks(df: pd.DataFrame):
     if pd.isna(median_gap) or median_gap <= pd.Timedelta(0):
         return []
 
-    # 抓出明顯大於平常K棒間距的空窗
-    big_gaps = diffs[diffs > median_gap * 3]
-    if big_gaps.empty:
-        return []
-
-    sorted_times = df["time"].sort_values().reset_index(drop=True)
+    gap_positions = np.where(diffs > median_gap * 3)[0]
     breaks = []
-    for idx in big_gaps.index:
-        prev_pos = sorted_times.index.get_loc(idx - 1) if (idx - 1) in sorted_times.index else None
-        curr_pos = sorted_times.index.get_loc(idx) if idx in sorted_times.index else None
-        if prev_pos is None or curr_pos is None:
-            continue
-        start_gap = sorted_times.iloc[prev_pos]
-        end_gap = sorted_times.iloc[curr_pos]
+
+    for pos in gap_positions:
+        start_gap = times.iloc[pos]
+        end_gap = times.iloc[pos + 1]
         breaks.append(dict(bounds=[start_gap, end_gap]))
 
     return breaks
-
 
 def create_main_chart(df, overlays, signals=None):
     fig = make_subplots(
@@ -1007,10 +1035,11 @@ def create_main_chart(df, overlays, signals=None):
 
     fig.update_layout(
         height=760,
+        title="主頁 K 線圖",
         xaxis_rangeslider_visible=True,
         legend_orientation="h",
         template="plotly_white",
-        margin=dict(l=20, r=20, t=30, b=20)
+        margin=dict(l=20, r=20, t=50, b=20)
     )
 
     if rangebreaks:
@@ -1019,8 +1048,10 @@ def create_main_chart(df, overlays, signals=None):
 
     return fig
 
-
 def create_indicator_chart(df, indicator_name):
+    info = INDICATOR_INFO.get(indicator_name, {})
+    title = info.get("title", indicator_name)
+
     fig = go.Figure()
 
     if indicator_name == "RSI":
@@ -1085,12 +1116,12 @@ def create_indicator_chart(df, indicator_name):
 
     fig.update_layout(
         height=320,
+        title=title,
         template="plotly_white",
-        margin=dict(l=20, r=20, t=30, b=20),
+        margin=dict(l=20, r=20, t=50, b=20),
         xaxis_rangeslider_visible=True
     )
     return fig
-
 
 def create_equity_curve(trades, choice):
     multiplier = contract_multipliers.get(choice, 1)
@@ -1105,11 +1136,26 @@ def create_equity_curve(trades, choice):
     fig.add_trace(go.Scatter(x=x, y=eq, mode="lines+markers", name="累積損益"))
     fig.update_layout(
         height=350,
+        title="累積損益曲線",
         template="plotly_white",
-        margin=dict(l=20, r=20, t=30, b=20)
+        margin=dict(l=20, r=20, t=50, b=20)
     )
     return fig
 
+def render_indicator_help(indicator_name: str):
+    info = INDICATOR_INFO.get(indicator_name, None)
+    if not info:
+        return
+    st.markdown(
+        f"""
+        <div class="indicator-help-box">
+            <b>{info['title']}</b><br>
+            {info['desc']}<br>
+            <span class="small-note">{info['rule']}</span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 # =========================================================
 # 左側控制區
@@ -1217,7 +1263,6 @@ with st.sidebar:
     run_backtest = st.button("開始回測", use_container_width=True)
     run_optimize = st.button("開始最佳化", use_container_width=True)
 
-
 # =========================================================
 # 資料處理
 # =========================================================
@@ -1236,7 +1281,6 @@ if len(kbar_df) < 10:
     st.warning("重整後 K 棒太少，請縮短週期或增加日期範圍。")
 
 indicator_df = add_all_indicators(kbar_df, params)
-
 
 # =========================================================
 # 主畫面
@@ -1262,7 +1306,7 @@ with left_col:
     checks.append("ADX 正常" if indicator_df["ADX"].dropna().between(0, 100).all() else "ADX 超出範圍")
     for c in checks:
         st.write(f"- {c}")
-    st.markdown('<div class="small-note">主圖已產生。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-note">附加指標已加上中文說明與圖表標題，方便判讀。</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with right_col:
@@ -1284,13 +1328,24 @@ with right_col:
         )
         st.plotly_chart(main_fig, use_container_width=True)
 
+        st.markdown("### 選擇要顯示的附加指標")
+        st.markdown("""
+        下面這些指標是用來補充主圖 K 線判讀的。  
+        你可以同時選幾個常用指標搭配看，例如：
+        - **RSI + MACD**：看轉強、轉弱與動能
+        - **KD + MFI**：看短線高低檔與資金變化
+        - **ATR + ADX**：看波動與趨勢強度
+        """)
+
         selected_indicators = st.multiselect(
             "選擇要顯示的附加指標",
             ["RSI", "MACD", "ATR", "OBV", "CCI", "KD", "WILLR", "MFI", "ROC", "MOM", "TRIX", "ADX", "BB_WIDTH"],
-            default=["RSI", "MACD", "ATR"]
+            default=["RSI", "MACD", "ATR"],
+            help="選擇後，系統會在下方顯示對應圖表與中文說明。"
         )
 
         for name in selected_indicators:
+            render_indicator_help(name)
             st.plotly_chart(create_indicator_chart(indicator_df, name), use_container_width=True)
 
     with tab_backtest:
