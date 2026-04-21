@@ -1455,7 +1455,7 @@ with left_col:
     checks.append("ADX 正常" if indicator_df["ADX"].dropna().between(0, 100).all() else "ADX 超出範圍")
     for c in checks:
         st.write(f"- {c}")
-    st.markdown('<div class="small-note">已新增 K棒型態策略，可用吞噬、錘頭、射擊之星回測。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-note">已畫出K線圖。</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="summary-card">', unsafe_allow_html=True)
