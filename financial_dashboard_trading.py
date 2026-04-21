@@ -471,6 +471,70 @@ def calc_adx(df, period=14):
     adx = dx.rolling(period, min_periods=period).mean()
     return clamp_series(adx, 0, 100), plus_di, minus_di
 
+# =========================================================
+# K棒型態策略函式
+# =========================================================
+def add_candlestick_pattern_columns(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+    data = df.copy()
+
+    open_ = data["open"]
+    high_ = data["high"]
+    low_ = data["low"]
+    close_ = data["close"]
+
+    body = (close_ - open_).abs()
+    candle_range = (high_ - low_).replace(0, np.nan)
+    upper_shadow = high_ - np.maximum(open_, close_)
+    lower_shadow = np.minimum(open_, close_) - low_
+
+    data["BODY"] = body
+    data["RANGE"] = candle_range
+    data["UPPER_SHADOW"] = upper_shadow
+    data["LOWER_SHADOW"] = lower_shadow
+    data["BULL"] = close_ > open_
+    data["BEAR"] = close_ < open_
+
+    body_ratio = params.get("pattern_body_ratio", 0.3)
+    shadow_ratio = params.get("pattern_shadow_ratio", 2.0)
+    small_upper_ratio = params.get("pattern_small_upper_ratio", 0.5)
+
+    prev_open = open_.shift(1)
+    prev_close = close_.shift(1)
+    prev_bull = prev_close > prev_open
+    prev_bear = prev_close < prev_open
+
+    # 多方吞噬：前一根陰線，當前陽線且實體包覆前一根實體
+    data["BULLISH_ENGULFING"] = (
+        prev_bear &
+        data["BULL"] &
+        (open_ <= prev_close) &
+        (close_ >= prev_open)
+    )
+
+    # 空方吞噬：前一根陽線，當前陰線且實體包覆前一根實體
+    data["BEARISH_ENGULFING"] = (
+        prev_bull &
+        data["BEAR"] &
+        (open_ >= prev_close) &
+        (close_ <= prev_open)
+    )
+
+    # 錘頭線：小實體 + 長下影線 + 短上影線
+    data["HAMMER"] = (
+        (body / candle_range <= body_ratio) &
+        (lower_shadow >= body * shadow_ratio) &
+        (upper_shadow <= body * small_upper_ratio)
+    )
+
+    # 射擊之星：小實體 + 長上影線 + 短下影線
+    data["SHOOTING_STAR"] = (
+        (body / candle_range <= body_ratio) &
+        (upper_shadow >= body * shadow_ratio) &
+        (lower_shadow <= body * small_upper_ratio)
+    )
+
+    return data
+
 def add_all_indicators(df, params):
     data = df.copy()
     data["MA_short"] = calc_ma(data, params["ma_short"])
@@ -508,6 +572,8 @@ def add_all_indicators(df, params):
     data["VWAP"] = calc_vwap(data)
     data["DON_UPPER"], data["DON_MID"], data["DON_LOWER"] = calc_donchian(data, params["donchian_period"])
     data["ADX"], data["PLUS_DI"], data["MINUS_DI"] = calc_adx(data, params["adx_period"])
+
+    data = add_candlestick_pattern_columns(data, params)
     return data
 
 # =========================================================
@@ -578,6 +644,28 @@ def backtest_strategy(df, strategy_name, params):
     qty = int(params["qty"])
     stop_loss = float(params["stop_loss"])
 
+    def candlestick_buy_signal(i):
+        sig = False
+        label = None
+        if params["use_bullish_engulfing"] and bool(data.loc[i, "BULLISH_ENGULFING"]):
+            sig = True
+            label = "多方吞噬"
+        elif params["use_hammer"] and bool(data.loc[i, "HAMMER"]):
+            sig = True
+            label = "錘頭線"
+        return sig, label
+
+    def candlestick_sell_signal(i):
+        sig = False
+        label = None
+        if params["use_bearish_engulfing"] and bool(data.loc[i, "BEARISH_ENGULFING"]):
+            sig = True
+            label = "空方吞噬"
+        elif params["use_shooting_star"] and bool(data.loc[i, "SHOOTING_STAR"]):
+            sig = True
+            label = "射擊之星"
+        return sig, label
+
     def buy_signal(i):
         if strategy_name == "移動平均線策略":
             return (
@@ -585,27 +673,36 @@ def backtest_strategy(df, strategy_name, params):
                 pd.notna(data.loc[i-1, "MA_long"]) and
                 data.loc[i-1, "MA_short"] <= data.loc[i-1, "MA_long"] and
                 data.loc[i, "MA_short"] > data.loc[i, "MA_long"]
-            )
+            ), "MA黃金交叉"
+
         elif strategy_name == "RSI逆勢策略":
-            return pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] < params["oversold"]
+            return pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] < params["oversold"], "RSI超賣"
+
         elif strategy_name == "布林通道策略":
-            return pd.notna(data.loc[i, "BB_LOWER"]) and data.loc[i, "close"] < data.loc[i, "BB_LOWER"]
+            return pd.notna(data.loc[i, "BB_LOWER"]) and data.loc[i, "close"] < data.loc[i, "BB_LOWER"], "跌破下軌"
+
         elif strategy_name == "MACD策略":
             return (
                 pd.notna(data.loc[i-1, "MACD"]) and pd.notna(data.loc[i-1, "MACD_SIGNAL"]) and
                 data.loc[i-1, "MACD"] <= data.loc[i-1, "MACD_SIGNAL"] and
                 data.loc[i, "MACD"] > data.loc[i, "MACD_SIGNAL"]
-            )
+            ), "MACD翻多"
+
         elif strategy_name == "KD策略":
             return (
                 pd.notna(data.loc[i-1, "K"]) and pd.notna(data.loc[i-1, "D"]) and
                 data.loc[i-1, "K"] <= data.loc[i-1, "D"] and
                 data.loc[i, "K"] > data.loc[i, "D"] and
                 data.loc[i, "K"] < params["oversold"]
-            )
+            ), "KD翻多"
+
+        elif strategy_name == "K棒型態策略":
+            return candlestick_buy_signal(i)
+
         elif strategy_name == "網格交易策略":
-            return False
-        return False
+            return False, None
+
+        return False, None
 
     def sell_signal(i):
         if strategy_name == "移動平均線策略":
@@ -614,27 +711,36 @@ def backtest_strategy(df, strategy_name, params):
                 pd.notna(data.loc[i-1, "MA_long"]) and
                 data.loc[i-1, "MA_short"] >= data.loc[i-1, "MA_long"] and
                 data.loc[i, "MA_short"] < data.loc[i, "MA_long"]
-            )
+            ), "MA死亡交叉"
+
         elif strategy_name == "RSI逆勢策略":
-            return pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] > params["overbought"]
+            return pd.notna(data.loc[i, "RSI"]) and data.loc[i, "RSI"] > params["overbought"], "RSI超買"
+
         elif strategy_name == "布林通道策略":
-            return pd.notna(data.loc[i, "BB_UPPER"]) and data.loc[i, "close"] > data.loc[i, "BB_UPPER"]
+            return pd.notna(data.loc[i, "BB_UPPER"]) and data.loc[i, "close"] > data.loc[i, "BB_UPPER"], "突破上軌"
+
         elif strategy_name == "MACD策略":
             return (
                 pd.notna(data.loc[i-1, "MACD"]) and pd.notna(data.loc[i-1, "MACD_SIGNAL"]) and
                 data.loc[i-1, "MACD"] >= data.loc[i-1, "MACD_SIGNAL"] and
                 data.loc[i, "MACD"] < data.loc[i, "MACD_SIGNAL"]
-            )
+            ), "MACD翻空"
+
         elif strategy_name == "KD策略":
             return (
                 pd.notna(data.loc[i-1, "K"]) and pd.notna(data.loc[i-1, "D"]) and
                 data.loc[i-1, "K"] >= data.loc[i-1, "D"] and
                 data.loc[i, "K"] < data.loc[i, "D"] and
                 data.loc[i, "K"] > params["overbought"]
-            )
+            ), "KD翻空"
+
+        elif strategy_name == "K棒型態策略":
+            return candlestick_sell_signal(i)
+
         elif strategy_name == "網格交易策略":
-            return False
-        return False
+            return False, None
+
+        return False, None
 
     if strategy_name == "網格交易策略":
         base_price = float(data.loc[0, "close"])
@@ -694,8 +800,11 @@ def backtest_strategy(df, strategy_name, params):
         next_time = data.loc[i + 1, "time"]
         current_close = float(data.loc[i, "close"])
 
+        buy_sig, buy_label = buy_signal(i)
+        sell_sig, sell_label = sell_signal(i)
+
         if position is None:
-            if buy_signal(i):
+            if buy_sig:
                 position = {
                     "side": "long",
                     "entry_time": next_time,
@@ -703,9 +812,9 @@ def backtest_strategy(df, strategy_name, params):
                     "qty": qty
                 }
                 stop_price = next_open - stop_loss
-                signals.append({"time": next_time, "price": next_open, "type": "buy", "label": "買進"})
+                signals.append({"time": next_time, "price": next_open, "type": "buy", "label": buy_label or "買進"})
 
-            elif sell_signal(i):
+            elif sell_sig:
                 position = {
                     "side": "short",
                     "entry_time": next_time,
@@ -713,22 +822,22 @@ def backtest_strategy(df, strategy_name, params):
                     "qty": qty
                 }
                 stop_price = next_open + stop_loss
-                signals.append({"time": next_time, "price": next_open, "type": "sell", "label": "放空"})
+                signals.append({"time": next_time, "price": next_open, "type": "sell", "label": sell_label or "放空"})
 
         else:
             if position["side"] == "long":
                 stop_price = max(stop_price, current_close - stop_loss)
-                if sell_signal(i) or current_close < stop_price:
+                if sell_sig or current_close < stop_price:
                     trades.append(close_trade(position, next_time, next_open, "long_exit"))
-                    signals.append({"time": next_time, "price": next_open, "type": "sell", "label": "平多"})
+                    signals.append({"time": next_time, "price": next_open, "type": "sell", "label": sell_label or "平多"})
                     position = None
                     stop_price = None
 
             elif position["side"] == "short":
                 stop_price = min(stop_price, current_close + stop_loss)
-                if buy_signal(i) or current_close > stop_price:
+                if buy_sig or current_close > stop_price:
                     trades.append(close_trade(position, next_time, next_open, "short_exit"))
-                    signals.append({"time": next_time, "price": next_open, "type": "buy", "label": "平空"})
+                    signals.append({"time": next_time, "price": next_open, "type": "buy", "label": buy_label or "平空"})
                     position = None
                     stop_price = None
 
@@ -793,7 +902,6 @@ def optimize_strategy(base_df, strategy_name, base_indicator_params, base_backte
             bt = base_backtest_params.copy()
             ind = base_indicator_params.copy()
             ind["rsi_period"] = rsi_p
-
             bt["oversold"] = osd
             bt["overbought"] = obd
 
@@ -876,7 +984,6 @@ def optimize_strategy(base_df, strategy_name, base_indicator_params, base_backte
         for kp, dp, osd, obd in itertools.product(k_periods, d_periods, oversolds, overboughts):
             ind = base_indicator_params.copy()
             bt = base_backtest_params.copy()
-
             ind["k_period"] = kp
             ind["d_period"] = dp
             bt["oversold"] = osd
@@ -892,6 +999,31 @@ def optimize_strategy(base_df, strategy_name, base_indicator_params, base_backte
                 "d_period": dp,
                 "oversold": osd,
                 "overbought": obd,
+                "交易數": perf_dict["交易數"],
+                "總盈虧": perf_dict["總盈虧"],
+                "勝率": perf_dict["勝率"],
+                "報酬風險比": perf_dict["報酬風險比"],
+                "_score": metric_value(perf_dict, optimize_metric)
+            })
+
+    elif strategy_name == "K棒型態策略":
+        body_ratios = [0.2, 0.3, 0.4]
+        shadow_ratios = [1.5, 2.0, 2.5]
+
+        for br, sr in itertools.product(body_ratios, shadow_ratios):
+            ind = base_indicator_params.copy()
+            bt = base_backtest_params.copy()
+            ind["pattern_body_ratio"] = br
+            ind["pattern_shadow_ratio"] = sr
+
+            df2 = add_all_indicators(base_df, ind)
+            trades, _ = backtest_strategy(df2, strategy_name, bt)
+            perf_df = calculate_performance(trades, choice)
+            perf_dict = performance_to_dict(perf_df)
+
+            results.append({
+                "pattern_body_ratio": br,
+                "pattern_shadow_ratio": sr,
                 "交易數": perf_dict["交易數"],
                 "總盈虧": perf_dict["總盈虧"],
                 "勝率": perf_dict["勝率"],
@@ -1210,7 +1342,19 @@ with st.sidebar:
         "trix_period": st.slider("TRIX 週期", 1, 100, 15),
         "donchian_period": st.slider("Donchian 週期", 2, 200, 20),
         "adx_period": st.slider("ADX 週期", 2, 100, 14),
+
+        # K棒型態參數
+        "pattern_body_ratio": st.slider("K棒型態：小實體比例上限", 0.1, 0.6, 0.3, 0.05),
+        "pattern_shadow_ratio": st.slider("K棒型態：長影線倍數", 1.0, 4.0, 2.0, 0.1),
+        "pattern_small_upper_ratio": st.slider("K棒型態：短影線倍數上限", 0.1, 1.0, 0.5, 0.1),
     }
+
+    st.markdown("---")
+    st.subheader("K棒型態策略選項")
+    use_bullish_engulfing = st.checkbox("啟用 多方吞噬", value=True)
+    use_bearish_engulfing = st.checkbox("啟用 空方吞噬", value=True)
+    use_hammer = st.checkbox("啟用 錘頭線", value=True)
+    use_shooting_star = st.checkbox("啟用 射擊之星", value=True)
 
     st.markdown("---")
     st.subheader("主圖疊加")
@@ -1231,6 +1375,7 @@ with st.sidebar:
             "布林通道策略",
             "MACD策略",
             "KD策略",
+            "K棒型態策略",
             "網格交易策略"
         ],
         index=0
@@ -1248,6 +1393,10 @@ with st.sidebar:
         "w_ma": 0.4,
         "w_rsi": 0.3,
         "w_bb": 0.3,
+        "use_bullish_engulfing": use_bullish_engulfing,
+        "use_bearish_engulfing": use_bearish_engulfing,
+        "use_hammer": use_hammer,
+        "use_shooting_star": use_shooting_star,
     }
 
     st.markdown("---")
@@ -1306,7 +1455,15 @@ with left_col:
     checks.append("ADX 正常" if indicator_df["ADX"].dropna().between(0, 100).all() else "ADX 超出範圍")
     for c in checks:
         st.write(f"- {c}")
-    st.markdown('<div class="small-note">附加指標已加上中文說明與圖表標題，方便判讀。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-note">已新增 K棒型態策略，可用吞噬、錘頭、射擊之星回測。</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="summary-card">', unsafe_allow_html=True)
+    st.subheader("K棒型態策略說明")
+    st.write("- 多方吞噬：前一根偏空，下一根偏多且實體包住前一根")
+    st.write("- 空方吞噬：前一根偏多，下一根偏空且實體包住前一根")
+    st.write("- 錘頭線：小實體、長下影線，常見於偏低檔反轉")
+    st.write("- 射擊之星：小實體、長上影線，常見於偏高檔反轉")
     st.markdown('</div>', unsafe_allow_html=True)
 
 with right_col:
@@ -1419,7 +1576,11 @@ with right_col:
                 best_indicator_params = params.copy()
                 best_backtest_params = backtest_params.copy()
 
-                for k in ["ma_short", "ma_long", "rsi_period", "bb_period", "bb_std", "macd_fast", "macd_slow", "macd_signal", "k_period", "d_period"]:
+                for k in [
+                    "ma_short", "ma_long", "rsi_period", "bb_period", "bb_std",
+                    "macd_fast", "macd_slow", "macd_signal", "k_period", "d_period",
+                    "pattern_body_ratio", "pattern_shadow_ratio"
+                ]:
                     if k in best_row and pd.notna(best_row[k]):
                         best_indicator_params[k] = best_row[k]
 
